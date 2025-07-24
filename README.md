@@ -365,8 +365,9 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ## References
 
 - [CARLA Documentation](https://carla.readthedocs.io/)
-- [Behavioral Cloning Paper](https://arxiv.org/abs/1604.07316)
 - [End-to-End Deep Learning for Self-Driving Cars](https://arxiv.org/abs/1604.07316)
+- [Dynamic Conditional Imitation Learning for Autonomous Driving](https://arxiv.org/abs/2211.11579)
+- [Autonomous Driving with Deep Reinforcement Learning in CARLA Simulation](https://arxiv.org/abs/2306.11217)
 
 ---
 
