@@ -13,7 +13,7 @@ A hybrid machine learning + rule-based autonomous driving system for CARLA simul
 ## Project Structure
 
 ```
-carla_autonomous_driving/
+autonomous_driving/
 ├── sensors/
 │   └── capture_sensors.py      # Raw sensor data collection
 ├── movement/
