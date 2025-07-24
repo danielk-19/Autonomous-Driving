@@ -5,7 +5,7 @@ A hybrid machine learning + rule-based autonomous driving system for CARLA simul
 ## Features
 
 - **Hybrid Agent**: Combines ML perception with rule-based safety systems
-- **Multi-Sensor Data Collection**: RGB, semantic segmentation, LiDAR, GPS
+- **Multi-Sensor Data Collection**: RGB, semantic segmentation, depth, GPS, IMU
 - **Comprehensive Evaluation**: Safety, efficiency, and comfort metrics
 - **Real-World Applicability**: Safety-first design with hard rule constraints
 - **Data Management**: Complete pipeline from collection to training
@@ -15,25 +15,25 @@ A hybrid machine learning + rule-based autonomous driving system for CARLA simul
 ```
 carla_autonomous_driving/
 ├── sensors/
-│   └── capture_sensors.py      # Sensor data collection and management
+│   └── capture_sensors.py      # Raw sensor data collection
 ├── movement/
-│   ├── perception.py           # Computer vision and sensor processing
-│   └── basic_agent.py         # Hybrid rule-based + ML agent
+│   ├── perception.py           # Computer vision processing
+│   └── basic_agent.py         # Hybrid ML + rule-based agent
 ├── data/
-│   ├── semantic/              # Semantic segmentation images
-│   ├── rgb/                   # RGB camera images (optional)
-│   └── metadata/              # GPS and steering data (JSON)
+│   ├── raw_sessions/          # Raw collected data
+│   └── processed/             # ML-ready processed data
 ├── models/
 │   ├── carla_dataset.py       # PyTorch dataset class
-│   ├── bc_model.py            # Behavioral cloning model
-│   └── train_bc.py            # Training script
+│   ├── bc_model.py            # Neural network architecture
+│   └── train_bc.py            # Model training script
 ├── evaluation/
-│   └── evaluate_agent.py      # Comprehensive agent evaluation
+│   └── evaluate_agent.py      # Agent performance testing
 ├── utils/
-│   ├── data_manager.py        # Dataset management and preprocessing
+│   ├── data_processor.py      # Raw → processed conversion
 │   └── utils.py               # Utility functions
+├── logs/                      # Runtime logs and metrics
 ├── main_autonomous.py         # Main execution script
-└── README.md                  # This file
+└── README.md                  # Project documentation
 ```
 
 ## Installation
@@ -45,9 +45,10 @@ carla_autonomous_driving/
 
 ### Dependencies
 ```bash
-pip install torch torchvision torchaudio
-pip install opencv-python pygame numpy matplotlib
-pip install pandas scikit-learn tqdm
+pip install torch>=1.9.0 torchvision>=0.10.0 torchaudio
+pip install opencv-python>=4.5.0 pygame>=2.0.0 numpy>=1.21.0
+pip install pandas>=1.3.0 scikit-learn>=1.0.0 matplotlib>=3.4.0
+pip install albumentations>=1.1.0
 pip install carla  # or add CARLA PythonAPI to your path
 ```
 
@@ -69,141 +70,111 @@ Collect training data using the autopilot:
 python sensors/capture_sensors.py --duration 1800  # 30 minutes
 ```
 
-This will collect:
+This will collect synchronized data at 20 FPS:
+- RGB camera images (800x600)
 - Semantic segmentation images (800x600)
-- GPS coordinates 
-- Steering/throttle/brake data
-- Synchronized frame data
+- Depth maps
+- GPS coordinates and IMU data
+- Vehicle control commands (steering/throttle/brake)
 
-### 2. Data Management
-Process and analyze your collected data:
+Data is saved in session folders: `data/raw_sessions/session_YYYYMMDD_HHMMSS/`
+
+### 2. Data Processing
+Convert raw sessions to ML-ready format:
 
 ```bash
-python utils/data_manager.py --data_root ./data --action all
+python utils/data_processor.py --input_dir ./data/raw_sessions --output_dir ./data/processed
 ```
 
 This will:
-- Analyze dataset statistics
-- Clean corrupted files
-- Create train/val/test splits
-- Balance steering distribution
-- Generate visualizations
-- Export training-ready data
+- Combine RGB and semantic data into training images
+- Consolidate metadata into episode-based measurements.json files
+- Create balanced train/val/test splits
+- Validate data quality and remove corrupted frames
 
 ### 3. Train ML Model
 Train the behavioral cloning model:
 
 ```bash
-python models/train_bc.py --data_dir ./data/training_ready --epochs 50
+python models/train_bc.py --data_dir ./data/processed --epochs 50 --batch_size 32
 ```
+
+Model architecture:
+- Input: RGB images (3, 224, 224)
+- Output: [steering, throttle, brake]
+- Backbone: ResNet18-based CNN
+- Loss: Weighted MSE (steering weight = 2.0)
 
 ### 4. Run Autonomous Agent
 Test your trained agent:
 
 ```bash
-python main_autonomous.py --model_path ./models/bc_model.pth
+python main_autonomous.py --model_path ./models/bc_model.pth --spawn_point random
 ```
 
 ### 5. Evaluate Performance
 Comprehensive evaluation across multiple scenarios:
 
 ```bash
-python evaluation/evaluate_agent.py
+python evaluation/evaluate_agent.py --model_path ./models/bc_model.pth --scenarios urban_driving
+```
+
+## Data Structure
+
+### Raw Data Collection Format
+```
+data/raw_sessions/session_YYYYMMDD_HHMMSS/
+├── rgb/           # RGB images: 000000.png, 000001.png, ...
+├── semantic/      # Semantic images: 000000.png, 000001.png, ...
+├── depth/         # Depth maps: 000000.npy, 000001.npy, ...
+├── gps/           # GPS data: 000000.json, 000001.json, ...
+├── imu/           # IMU data: 000000.json, 000001.json, ...
+└── control/       # Control data: 000000.json, 000001.json, ...
+```
+
+### Processed Data Format (ML-ready)
+```
+data/processed/
+├── episodes/
+│   ├── episode_001/
+│   │   ├── images/           # Combined training images: 000000.png, ...
+│   │   └── measurements.json # All frame metadata in single file
+│   └── episode_002/
+│       ├── images/
+│       └── measurements.json
+├── train_samples.json
+├── val_samples.json
+├── test_samples.json
+└── data_splits.json
 ```
 
 ## System Architecture
 
+### Data Flow Pipeline
+```
+1. Collection:  capture_sensors.py → Raw session data
+2. Processing:  data_processor.py → Processed episodes  
+3. Training:    train_bc.py + dataset + model → Trained weights
+4. Deployment:  main_autonomous.py + agent → Autonomous driving
+5. Evaluation:  evaluate_agent.py → Performance metrics
+```
+
 ### Hybrid Agent Design
 ```
-Sensor Input → Perception → Planning → Safety Check → Control Output
-     ↓           ↓           ↓           ↓            ↓
-   RGB/Sem    Lane Det.   Path Plan   Rule Check   Steering
-   LiDAR      Object Det.  Speed Plan  Collision    Throttle
-   GPS        Traffic Det. Navigation  Traffic Laws  Brake
+Sensor Input → Perception → ML Prediction → Safety Check → Control Output
+     ↓           ↓              ↓             ↓            ↓
+   RGB/Sem    Lane Det.     Steering      Rule Check   Final Steering
+   Depth      Object Det.   Throttle      Collision    Final Throttle
+   GPS/IMU    Traffic Det.  Brake         Traffic Laws Final Brake
 ```
 
-### Safety-First Approach
-- **Hard Rules**: Traffic lights, collision avoidance, speed limits
-- **ML Assistance**: Lane following, smooth control, obstacle navigation
-- **Fail-Safe**: Emergency stop and rule override capabilities
-
-## Usage Examples
-
-### Basic Data Collection
-```python
-from sensors.capture_sensors import SensorManager
-
-# Setup sensors and collect data
-sensor_manager = SensorManager(vehicle, world)
-sensor_manager.setup_sensors()
-
-# Collect for 1000 frames
-for i in range(1000):
-    world.tick()
-    data = sensor_manager.get_latest_data()
-    sensor_manager.save_frame(data, i)
-```
-
-### Running Custom Agent
-```python
-from movement.basic_agent import HybridAgent
-from movement.perception import PerceptionSystem
-
-# Initialize systems
-agent = HybridAgent(vehicle, world.get_map())
-perception = PerceptionSystem()
-
-# Main driving loop
-while True:
-    # Get sensor data
-    sensor_data = get_sensor_data()
-    
-    # Process with perception system
-    scene_data = perception.process_frame(
-        sensor_data['rgb'],
-        sensor_data['semantic']
-    )
-    
-    # Get control command
-    control = agent.run_step(scene_data)
-    vehicle.apply_control(control)
-```
-
-### Custom Evaluation
-```python
-from evaluation.evaluate_agent import AgentEvaluator
-
-evaluator = AgentEvaluator(client, world)
-results = evaluator.run_evaluation(
-    scenario='urban_driving',
-    duration=300,
-    traffic_density='high'
-)
-
-print(f"Safety Score: {results['scores']['safety']}/100")
-print(f"Overall Score: {results['scores']['overall']}/100")
-```
-
-## Evaluation Metrics
-
-### Safety Metrics
-- Traffic light violations
-- Speed limit violations  
-- Collision count
-- Lane departure incidents
-- Emergency stops
-
-### Performance Metrics
-- Route completion rate
-- Average speed
-- Time to destination
-- Fuel efficiency equivalent
-
-### Comfort Metrics
-- Steering smoothness
-- Acceleration smoothness
-- Passenger comfort score
-- Following distance maintenance
+### Safety-First Approach (Non-negotiable Rules)
+- **Emergency brake** on collision risk
+- **Traffic light compliance** - mandatory stops
+- **Speed limit enforcement** (50 km/h maximum)
+- **Lane departure prevention** 
+- **Following distance maintenance** (3m minimum)
+- **ML override capability** for safety violations
 
 ## Configuration
 
@@ -215,9 +186,19 @@ CAMERA_WIDTH = 800
 CAMERA_HEIGHT = 600
 FRAME_RATE = 20  # fps
 SENSOR_TICK = 0.05  # seconds
+FOV = 90  # degrees
 ```
 
-**Agent Behavior** (`movement/basic_agent.py`):
+**Model Training** (`models/train_bc.py`):
+```python
+BATCH_SIZE = 32
+LEARNING_RATE = 0.001
+NUM_EPOCHS = 50
+IMAGE_SIZE = (224, 224)
+STEERING_WEIGHT = 2.0  # Loss weighting
+```
+
+**Agent Safety** (`movement/basic_agent.py`):
 ```python
 SAFETY_DISTANCE = 3.0  # meters
 MAX_SPEED = 50  # km/h
@@ -225,62 +206,151 @@ REACTION_TIME = 0.3  # seconds
 EMERGENCY_BRAKE_DISTANCE = 5.0  # meters
 ```
 
-**Training** (`models/train_bc.py`):
+## Performance Targets
+
+- **Training**: <0.1 MSE on validation set
+- **Safety**: <1 violation per 1000 frames
+- **Efficiency**: >80% route completion rate  
+- **Comfort**: <0.5 m/s² average acceleration
+
+## Evaluation Metrics
+
+### Safety Metrics
+- Traffic light violations
+- Speed limit violations  
+- Collision count
+- Lane departure incidents
+- Emergency stops triggered
+
+### Performance Metrics
+- Route completion rate
+- Average speed maintenance
+- Time to destination
+- Navigation accuracy
+
+### Comfort Metrics
+- Steering smoothness (jerk minimization)
+- Acceleration smoothness
+- Passenger comfort score
+- Following distance consistency
+
+## Usage Examples
+
+### Basic Data Collection
 ```python
-BATCH_SIZE = 32
-LEARNING_RATE = 0.001
-NUM_EPOCHS = 50
-IMAGE_SIZE = (224, 224)
+from sensors.capture_sensors import SensorManager
+
+# Initialize and collect data
+sensor_manager = SensorManager(vehicle, world)
+sensor_manager.setup_sensors()
+
+# Collect synchronized frames
+for frame_id in range(1000):
+    world.tick()
+    data = sensor_manager.get_latest_data()
+    sensor_manager.save_frame(data, frame_id)
+```
+
+### Running the Autonomous Agent
+```python
+from movement.basic_agent import HybridAgent
+from models.bc_model import BehavioralCloningModel
+
+# Load trained model
+model = BehavioralCloningModel()
+model.load_state_dict(torch.load('models/bc_model.pth'))
+
+# Initialize hybrid agent
+agent = HybridAgent(vehicle, world.get_map(), model)
+
+# Main driving loop
+while True:
+    sensor_data = get_sensor_data()
+    control = agent.run_step(sensor_data)
+    vehicle.apply_control(control)
+```
+
+### Custom Evaluation
+```python
+from evaluation.evaluate_agent import AgentEvaluator
+
+evaluator = AgentEvaluator(client, world)
+results = evaluator.run_evaluation(
+    model_path='models/bc_model.pth',
+    scenarios=['urban_driving', 'highway', 'rural'],
+    duration=300  # seconds per scenario
+)
+
+print(f"Safety Score: {results['safety_score']}/100")
+print(f"Overall Performance: {results['overall_score']}/100")
 ```
 
 ## Troubleshooting
 
 ### Common Issues
 
-**Vehicle Won't Move**
-```python
-# Add this after spawning vehicle
-vehicle = world.spawn_actor(blueprint, spawn_point)
-world.tick()  # Critical: let vehicle settle
-vehicle.set_autopilot(True)
-```
-
-**Sensor Data Not Saving**
-- Check disk space and permissions
-- Verify CARLA server is running in synchronous mode
-- Ensure output directories exist
+**Data Collection Problems**
+- Ensure CARLA is running in synchronous mode
+- Check disk space for large datasets
+- Verify sensor tick rate matches world tick rate
+- Use `world.tick()` after vehicle spawn
 
 **Training Convergence Issues**
-- Check dataset balance (straight vs turning)
-- Verify image preprocessing pipeline
-- Monitor loss curves and learning rate
+- Balance steering distribution in dataset
+- Check for corrupted images or metadata
+- Monitor loss curves and adjust learning rate
+- Ensure proper train/val/test splits
 
-**Agent Evaluation Errors**
-- Ensure all required sensor data is available
-- Check CARLA version compatibility
-- Verify traffic manager settings
+**Agent Performance Issues**
+- Verify model input preprocessing matches training
+- Check safety rule implementation
+- Monitor sensor data quality in real-time
+- Validate traffic light detection accuracy
 
 ### Performance Optimization
 
-**For Better FPS**:
-- Reduce camera resolution
-- Disable unnecessary sensors
-- Use semantic-only (no RGB) collection
+**For Data Collection**:
+- Use semantic-only mode to save storage
+- Reduce camera resolution for faster processing
 - Run headless (no pygame display)
+- Use SSD storage for better I/O performance
 
-**For Better Training**:
-- Balance dataset steering distribution
-- Use data augmentation
+**For Training**:
+- Use data augmentation (rotation, brightness)
 - Implement curriculum learning
-- Add more diverse scenarios
+- Use mixed precision training
+- Balance dataset across scenarios
+
+**For Runtime**:
+- Optimize model inference with TensorRT
+- Use efficient image preprocessing
+- Minimize sensor data copying
+- Implement multi-threading for sensors
+
+## File Naming Conventions
+
+- **Images**: `{frame_id:06d}.png` (e.g., `000000.png`)
+- **Raw metadata**: `{frame_id:06d}.json` per sensor type
+- **Processed episodes**: `episode_{id:03d}` (e.g., `episode_001`)
+- **Sessions**: `session_{timestamp}` (e.g., `session_20240101_120000`)
 
 ## Contributing
 
 1. Fork the repository
 2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
+3. Follow the master specification exactly
+4. Add unit tests for new components
+5. Commit changes (`git commit -m 'Add amazing feature'`)
+6. Push to branch (`git push origin feature/amazing-feature`)
+7. Open a Pull Request
+
+## Testing Requirements
+
+- Unit tests for each major component
+- Integration tests for data pipeline
+- Performance benchmarks for agent
+- Memory and speed profiling
+- Safety scenario validation
 
 ## License
 
@@ -288,7 +358,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## Acknowledgments
 
-- CARLA Simulator team for the excellent autonomous driving platform
+- CARLA Simulator team for the autonomous driving platform
 - PyTorch community for deep learning frameworks
 - OpenCV community for computer vision tools
 

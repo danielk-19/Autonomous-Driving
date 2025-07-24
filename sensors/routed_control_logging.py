@@ -14,7 +14,7 @@ sys.path.insert(0, str(root_path))
 try:
     import carla
 except ImportError:
-    raise RuntimeError('Cannot import CARLA or behavior_agent.')
+    raise RuntimeError('Cannot import CARLA.')
 
 # globals
 frame = 0
