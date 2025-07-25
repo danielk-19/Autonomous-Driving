@@ -10,7 +10,6 @@ Handles:
 - Data quality validation
 """
 
-import json
 import numpy as np
 import cv2
 from pathlib import Path
@@ -23,8 +22,18 @@ import shutil
 from datetime import datetime
 import logging
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Import utilities from our utils module
+import sys
+root_path = Path(__file__).parent.parent
+sys.path.insert(0, str(root_path))
+
+from utils.utils import (
+    setup_logging, load_json, save_json, ensure_dir, get_timestamp,
+    safe_float, safe_int, load_image, save_image, combine_rgb_semantic,
+    validate_measurements_format, Timer, PerformanceMonitor
+)
+
+# Setup logging
 logger = logging.getLogger(__name__)
 
 class DataProcessor:
@@ -53,8 +62,11 @@ class DataProcessor:
         self.episodes_dir = self.processed_dir / "episodes"
         
         # Create processed directories
-        self.processed_dir.mkdir(exist_ok=True)
-        self.episodes_dir.mkdir(exist_ok=True)
+        ensure_dir(self.processed_dir)
+        ensure_dir(self.episodes_dir)
+        
+        # Initialize performance monitor
+        self.performance = PerformanceMonitor()
         
         logger.info(f"DataProcessor initialized with data root: {self.data_root}")
     
@@ -67,27 +79,28 @@ class DataProcessor:
         
         if not session_dirs:
             logger.warning(f"No session directories found in {self.raw_sessions_dir}")
-            return
+            return 0, 0
         
         logger.info(f"Found {len(session_dirs)} sessions to process")
         
         episode_counter = 1
         total_frames = 0
         
-        for session_dir in sorted(session_dirs):
-            logger.info(f"Processing session: {session_dir.name}")
-            
-            try:
-                frames_processed = self.process_session(session_dir, episode_counter)
-                if frames_processed > 0:
-                    total_frames += frames_processed
-                    episode_counter += 1
-                    logger.info(f"Session processed: {frames_processed} frames")
-                else:
-                    logger.warning(f"No valid frames found in session: {session_dir.name}")
-            except Exception as e:
-                logger.error(f"Failed to process session {session_dir.name}: {e}")
-                continue
+        with Timer("All sessions processing"):
+            for session_dir in sorted(session_dirs):
+                logger.info(f"Processing session: {session_dir.name}")
+                
+                try:
+                    frames_processed = self.process_session(session_dir, episode_counter)
+                    if frames_processed > 0:
+                        total_frames += frames_processed
+                        episode_counter += 1
+                        logger.info(f"Session processed: {frames_processed} frames")
+                    else:
+                        logger.warning(f"No valid frames found in session: {session_dir.name}")
+                except Exception as e:
+                    logger.error(f"Failed to process session {session_dir.name}: {e}")
+                    continue
         
         logger.info(f"Processing complete! Created {episode_counter-1} episodes with {total_frames} total frames")
         
@@ -101,9 +114,9 @@ class DataProcessor:
         
         # Create episode directory
         episode_dir = self.episodes_dir / f"episode_{episode_id:03d}"
-        episode_dir.mkdir(exist_ok=True)
+        ensure_dir(episode_dir)
         images_dir = episode_dir / "images"
-        images_dir.mkdir(exist_ok=True)
+        ensure_dir(images_dir)
         
         # Get all frame IDs from RGB directory
         rgb_dir = session_dir / "rgb"
@@ -125,23 +138,27 @@ class DataProcessor:
         
         for frame_id in frame_ids:
             try:
+                self.performance.log_frame()
+                
                 # Validate that all required data exists for this frame
-                if not self.validate_frame_data(session_dir, frame_id):
+                if not self._validate_frame_data(session_dir, frame_id):
                     logger.debug(f"Skipping frame {frame_id} - missing data")
                     continue
                 
-                # Combine RGB and semantic images
-                combined_image = self.combine_rgb_semantic(session_dir, frame_id)
+                # Combine RGB and semantic images using utils function
+                combined_image = self._combine_images_for_frame(session_dir, frame_id)
                 if combined_image is None:
                     logger.debug(f"Failed to combine images for frame {frame_id}")
                     continue
                 
-                # Save combined image
+                # Save combined image using utils function
                 output_image_path = images_dir / f"{frame_id}.png"
-                cv2.imwrite(str(output_image_path), combined_image)
+                if not save_image(combined_image, output_image_path):
+                    logger.debug(f"Failed to save image for frame {frame_id}")
+                    continue
                 
                 # Load and consolidate metadata
-                frame_measurements = self.load_frame_measurements(session_dir, frame_id)
+                frame_measurements = self._load_frame_measurements(session_dir, frame_id)
                 if frame_measurements is None:
                     logger.debug(f"Failed to load measurements for frame {frame_id}")
                     continue
@@ -150,21 +167,23 @@ class DataProcessor:
                 valid_frames += 1
                 
                 if valid_frames % 100 == 0:
-                    logger.info(f"Processed {valid_frames} frames...")
+                    fps = self.performance.get_fps()
+                    logger.info(f"Processed {valid_frames} frames... (FPS: {fps:.1f})")
                 
             except Exception as e:
                 logger.error(f"Error processing frame {frame_id}: {e}")
                 continue
         
-        # Save measurements.json
+        # Save measurements.json using utils function
         measurements_file = episode_dir / "measurements.json"
-        with open(measurements_file, 'w') as f:
-            json.dump(measurements, f, indent=2)
+        if not save_json(measurements, measurements_file):
+            logger.error(f"Failed to save measurements for episode {episode_id}")
+            return 0
         
         logger.info(f"Episode {episode_id} complete: {valid_frames} valid frames")
         return valid_frames
     
-    def validate_frame_data(self, session_dir, frame_id):
+    def _validate_frame_data(self, session_dir, frame_id):
         """Validate that all required data files exist for a frame"""
         required_files = [
             session_dir / "rgb" / f"{frame_id}.png",
@@ -176,15 +195,15 @@ class DataProcessor:
         
         return all(f.exists() for f in required_files)
     
-    def combine_rgb_semantic(self, session_dir, frame_id):
-        """Combine RGB and semantic images for training"""
+    def _combine_images_for_frame(self, session_dir, frame_id):
+        """Combine RGB and semantic images for training using utils function"""
         rgb_path = session_dir / "rgb" / f"{frame_id}.png"
         semantic_path = session_dir / "semantic" / f"{frame_id}.png"
         
         try:
-            # Load images
-            rgb_img = cv2.imread(str(rgb_path))
-            semantic_img = cv2.imread(str(semantic_path))
+            # Load images using utils function
+            rgb_img = load_image(rgb_path)
+            semantic_img = load_image(semantic_path)
             
             if rgb_img is None or semantic_img is None:
                 return None
@@ -194,13 +213,8 @@ class DataProcessor:
             rgb_resized = cv2.resize(rgb_img, target_size)
             semantic_resized = cv2.resize(semantic_img, target_size)
             
-            # Combine: RGB as main + semantic as overlay with transparency
-            # Convert semantic to single channel for overlay
-            semantic_gray = cv2.cvtColor(semantic_resized, cv2.COLOR_BGR2GRAY)
-            semantic_colored = cv2.applyColorMap(semantic_gray, cv2.COLORMAP_JET)
-            
-            # Blend images (70% RGB, 30% semantic overlay)
-            combined = cv2.addWeighted(rgb_resized, 0.7, semantic_colored, 0.3, 0)
+            # Use utils function to combine images
+            combined = combine_rgb_semantic(rgb_resized, semantic_resized, alpha=0.7)
             
             return combined
             
@@ -208,45 +222,38 @@ class DataProcessor:
             logger.error(f"Error combining images for frame {frame_id}: {e}")
             return None
     
-    def load_frame_measurements(self, session_dir, frame_id):
-        """Load and consolidate all measurements for a single frame"""
+    def _load_frame_measurements(self, session_dir, frame_id):
+        """Load and consolidate all measurements for a single frame using utils functions"""
         try:
-            # Load control data
-            control_path = session_dir / "control" / f"{frame_id}.json"
-            with open(control_path, 'r') as f:
-                control_data = json.load(f)
+            # Load data using utils functions
+            control_data = load_json(session_dir / "control" / f"{frame_id}.json")
+            gps_data = load_json(session_dir / "gps" / f"{frame_id}.json")
+            imu_data = load_json(session_dir / "imu" / f"{frame_id}.json")
             
-            # Load GPS data
-            gps_path = session_dir / "gps" / f"{frame_id}.json"
-            with open(gps_path, 'r') as f:
-                gps_data = json.load(f)
+            if not all([control_data, gps_data, imu_data]):
+                return None
             
-            # Load IMU data
-            imu_path = session_dir / "imu" / f"{frame_id}.json"
-            with open(imu_path, 'r') as f:
-                imu_data = json.load(f)
-            
-            # Create consolidated measurement
+            # Create consolidated measurement using safe conversion functions
             measurement = {
-                "frame_id": int(frame_id),
+                "frame_id": safe_int(frame_id),
                 "timestamp": control_data.get("timestamp", datetime.now().isoformat()),
-                "steering": float(control_data.get("steer", 0.0)),
-                "throttle": float(control_data.get("throttle", 0.0)),
-                "brake": float(control_data.get("brake", 0.0)),
-                "speed": float(control_data.get("speed", 0.0)),
+                "steering": safe_float(control_data.get("steer", 0.0)),
+                "throttle": safe_float(control_data.get("throttle", 0.0)),
+                "brake": safe_float(control_data.get("brake", 0.0)),
+                "speed": safe_float(control_data.get("speed", 0.0)),
                 "gps": {
-                    "lat": float(gps_data.get("lat", 0.0)),
-                    "lon": float(gps_data.get("lon", 0.0)),
-                    "alt": float(gps_data.get("alt", 0.0))
+                    "lat": safe_float(gps_data.get("lat", 0.0)),
+                    "lon": safe_float(gps_data.get("lon", 0.0)),
+                    "alt": safe_float(gps_data.get("alt", 0.0))
                 },
                 "imu": {
-                    "accel_x": float(imu_data.get("accel_x", 0.0)),
-                    "accel_y": float(imu_data.get("accel_y", 0.0)),
-                    "accel_z": float(imu_data.get("accel_z", 9.8)),
-                    "gyro_x": float(imu_data.get("gyro_x", 0.0)),
-                    "gyro_y": float(imu_data.get("gyro_y", 0.0)),
-                    "gyro_z": float(imu_data.get("gyro_z", 0.0)),
-                    "compass": float(imu_data.get("compass", 0.0))
+                    "accel_x": safe_float(imu_data.get("accel_x", 0.0)),
+                    "accel_y": safe_float(imu_data.get("accel_y", 0.0)),
+                    "accel_z": safe_float(imu_data.get("accel_z", 9.8)),
+                    "gyro_x": safe_float(imu_data.get("gyro_x", 0.0)),
+                    "gyro_y": safe_float(imu_data.get("gyro_y", 0.0)),
+                    "gyro_z": safe_float(imu_data.get("gyro_z", 0.0)),
+                    "compass": safe_float(imu_data.get("compass", 0.0))
                 }
             }
             
@@ -266,7 +273,7 @@ class DataProcessor:
         
         if not episode_dirs:
             logger.warning("No episodes found for splitting")
-            return
+            return None
         
         episode_ids = sorted([d.name for d in episode_dirs])
         logger.info(f"Found {len(episode_ids)} episodes for splitting")
@@ -285,10 +292,9 @@ class DataProcessor:
             total = 0
             for episode_id in episode_list:
                 measurements_file = self.episodes_dir / episode_id / "measurements.json"
-                if measurements_file.exists():
-                    with open(measurements_file, 'r') as f:
-                        measurements = json.load(f)
-                        total += len(measurements)
+                measurements = load_json(measurements_file)
+                if measurements:
+                    total += len(measurements)
             return total
         
         train_samples = count_episode_samples(train_episodes)
@@ -301,47 +307,46 @@ class DataProcessor:
         logger.info(f"  Test: {len(test_episodes)} episodes, {test_samples} samples")
         
         # Create sample lists for each split
-        train_sample_list = self.create_sample_list(train_episodes)
-        val_sample_list = self.create_sample_list(val_episodes)
-        test_sample_list = self.create_sample_list(test_episodes)
+        train_sample_list = self._create_sample_list(train_episodes)
+        val_sample_list = self._create_sample_list(val_episodes)
+        test_sample_list = self._create_sample_list(test_episodes)
         
-        # Save splits
+        # Save splits using utils functions
         splits_data = {
             "train_episodes": train_episodes,
             "val_episodes": val_episodes,
             "test_episodes": test_episodes,
             "train_samples": train_samples,
             "val_samples": val_samples,
-            "test_samples": test_samples
+            "test_samples": test_samples,
+            "created_at": datetime.now().isoformat()
         }
         
-        # Save main splits file
-        with open(self.processed_dir / "data_splits.json", 'w') as f:
-            json.dump(splits_data, f, indent=2)
+        # Save all split files
+        split_files = [
+            (self.processed_dir / "data_splits.json", splits_data),
+            (self.processed_dir / "train_samples.json", train_sample_list),
+            (self.processed_dir / "val_samples.json", val_sample_list),
+            (self.processed_dir / "test_samples.json", test_sample_list)
+        ]
         
-        # Save individual sample lists
-        with open(self.processed_dir / "train_samples.json", 'w') as f:
-            json.dump(train_sample_list, f, indent=2)
-        
-        with open(self.processed_dir / "val_samples.json", 'w') as f:
-            json.dump(val_sample_list, f, indent=2)
-        
-        with open(self.processed_dir / "test_samples.json", 'w') as f:
-            json.dump(test_sample_list, f, indent=2)
+        for file_path, data in split_files:
+            if not save_json(data, file_path):
+                logger.error(f"Failed to save {file_path}")
+                return None
         
         logger.info("Data splits saved successfully")
         return splits_data
     
-    def create_sample_list(self, episode_list):
+    def _create_sample_list(self, episode_list):
         """Create list of individual samples for a split"""
         samples = []
         
         for episode_id in episode_list:
             measurements_file = self.episodes_dir / episode_id / "measurements.json"
-            if measurements_file.exists():
-                with open(measurements_file, 'r') as f:
-                    measurements = json.load(f)
-                    
+            measurements = load_json(measurements_file)
+            
+            if measurements:
                 for measurement in measurements:
                     sample = {
                         "episode": episode_id,
@@ -370,49 +375,57 @@ class DataProcessor:
         
         for episode_dir in episode_dirs:
             measurements_file = episode_dir / "measurements.json"
-            if measurements_file.exists():
-                with open(measurements_file, 'r') as f:
-                    measurements = json.load(f)
-                    total_frames += len(measurements)
-                    
-                    for m in measurements:
-                        steering_data.append(m["steering"])
-                        speed_data.append(m["speed"])
+            measurements = load_json(measurements_file)
+            
+            if measurements:
+                total_frames += len(measurements)
+                
+                for m in measurements:
+                    steering_data.append(m["steering"])
+                    speed_data.append(m["speed"])
         
         logger.info(f"Dataset Statistics:")
         logger.info(f"  Episodes: {len(episode_dirs)}")
         logger.info(f"  Total frames: {total_frames}")
         
-        if steering_data:
-            logger.info(f"  Steering - Mean: {np.mean(steering_data):.3f}, "
-                       f"Std: {np.std(steering_data):.3f}, "
-                       f"Range: [{np.min(steering_data):.3f}, {np.max(steering_data):.3f}]")
-            
-            logger.info(f"  Speed - Mean: {np.mean(speed_data):.3f}, "
-                       f"Std: {np.std(speed_data):.3f}, "
-                       f"Range: [{np.min(speed_data):.3f}, {np.max(speed_data):.3f}]")
-            
-            # Plot distributions
-            self.plot_data_distributions(steering_data, speed_data)
-        
-        return {
+        stats = {
             'episodes': len(episode_dirs),
             'total_frames': total_frames,
-            'steering_stats': {
-                'mean': np.mean(steering_data) if steering_data else 0,
-                'std': np.std(steering_data) if steering_data else 0,
-                'min': np.min(steering_data) if steering_data else 0,
-                'max': np.max(steering_data) if steering_data else 0
-            },
-            'speed_stats': {
-                'mean': np.mean(speed_data) if speed_data else 0,
-                'std': np.std(speed_data) if speed_data else 0,
-                'min': np.min(speed_data) if speed_data else 0,
-                'max': np.max(speed_data) if speed_data else 0
-            }
+            'steering_stats': {},
+            'speed_stats': {}
         }
+        
+        if steering_data:
+            stats['steering_stats'] = {
+                'mean': np.mean(steering_data),
+                'std': np.std(steering_data),
+                'min': np.min(steering_data),
+                'max': np.max(steering_data),
+                'median': np.median(steering_data)
+            }
+            
+            stats['speed_stats'] = {
+                'mean': np.mean(speed_data),
+                'std': np.std(speed_data),
+                'min': np.min(speed_data),
+                'max': np.max(speed_data),
+                'median': np.median(speed_data)
+            }
+            
+            logger.info(f"  Steering - Mean: {stats['steering_stats']['mean']:.3f}, "
+                       f"Std: {stats['steering_stats']['std']:.3f}, "
+                       f"Range: [{stats['steering_stats']['min']:.3f}, {stats['steering_stats']['max']:.3f}]")
+            
+            logger.info(f"  Speed - Mean: {stats['speed_stats']['mean']:.3f}, "
+                       f"Std: {stats['speed_stats']['std']:.3f}, "
+                       f"Range: [{stats['speed_stats']['min']:.3f}, {stats['speed_stats']['max']:.3f}]")
+            
+            # Plot distributions
+            self._plot_data_distributions(steering_data, speed_data)
+        
+        return stats
     
-    def plot_data_distributions(self, steering_data, speed_data):
+    def _plot_data_distributions(self, steering_data, speed_data):
         """Plot steering and speed distributions"""
         fig, axes = plt.subplots(2, 2, figsize=(12, 8))
         
@@ -449,7 +462,7 @@ class DataProcessor:
         logger.info(f"Data analysis plots saved to: {plot_path}")
     
     def validate_processed_data(self):
-        """Validate processed data integrity"""
+        """Validate processed data integrity using utils functions"""
         logger.info("Validating processed data...")
         
         issues = []
@@ -473,13 +486,16 @@ class DataProcessor:
                 issues.append(f"Missing images directory in {episode_id}")
                 continue
             
-            # Load measurements
-            try:
-                with open(measurements_file, 'r') as f:
-                    measurements = json.load(f)
-            except Exception as e:
-                issues.append(f"Corrupted measurements.json in {episode_id}: {e}")
+            # Load measurements using utils function
+            measurements = load_json(measurements_file)
+            if not measurements:
+                issues.append(f"Corrupted measurements.json in {episode_id}")
                 continue
+            
+            # Validate measurements format using utils function
+            format_errors = validate_measurements_format(measurements)
+            if format_errors:
+                issues.extend([f"{episode_id}: {error}" for error in format_errors[:5]])  # Limit errors
             
             # Check image-measurement alignment
             image_files = list(images_dir.glob("*.png"))
@@ -488,8 +504,8 @@ class DataProcessor:
                 issues.append(f"Image count mismatch in {episode_id}: "
                             f"{len(image_files)} images vs {len(measurements)} measurements")
             
-            # Check for missing images
-            for measurement in measurements:
+            # Check for missing images (sample check)
+            for i, measurement in enumerate(measurements[:10]):  # Check first 10
                 frame_id = measurement["frame_id"]
                 image_path = images_dir / f"{frame_id:06d}.png"
                 if not image_path.exists():
@@ -539,19 +555,15 @@ class DataProcessor:
                 should_remove = True
                 logger.info(f"Removing {episode_id}: missing essential files")
             else:
-                # Check if measurements can be loaded
-                try:
-                    with open(measurements_file, 'r') as f:
-                        measurements = json.load(f)
-                    
-                    # Check if episode has sufficient data (at least 10 frames)
-                    if len(measurements) < 10:
-                        should_remove = True
-                        logger.info(f"Removing {episode_id}: insufficient data ({len(measurements)} frames)")
-                    
-                except Exception as e:
+                # Check if measurements can be loaded using utils function
+                measurements = load_json(measurements_file)
+                
+                if not measurements:
                     should_remove = True
-                    logger.info(f"Removing {episode_id}: corrupted measurements ({e})")
+                    logger.info(f"Removing {episode_id}: corrupted measurements")
+                elif len(measurements) < 10:
+                    should_remove = True
+                    logger.info(f"Removing {episode_id}: insufficient data ({len(measurements)} frames)")
             
             if should_remove:
                 shutil.rmtree(episode_dir)
@@ -576,8 +588,14 @@ def main():
     parser.add_argument('--action', type=str, choices=[
         'process', 'analyze', 'validate', 'clean', 'all'
     ], default='all', help='Action to perform')
+    parser.add_argument('--log_level', type=str, default='INFO',
+                       choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
+                       help='Logging level')
     
     args = parser.parse_args()
+    
+    # Setup logging using utils function
+    setup_logging(getattr(logging, args.log_level))
     
     # Initialize processor
     processor = DataProcessor(args.data_root)
