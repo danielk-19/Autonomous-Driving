@@ -6,6 +6,7 @@ Processes sensor data to understand the environment.
 import numpy as np
 import cv2
 import time
+import logging
 from enum import Enum
 from dataclasses import dataclass, field
 from typing import List, Tuple, Optional, Dict, Any
@@ -15,6 +16,13 @@ import sys
 # Add project root to path
 root_path = Path(__file__).parent.parent
 sys.path.insert(0, str(root_path))
+
+# Import utility functions
+from utils.utils import (
+    setup_logging, Timer, LoggingContext, clamp, normalize_angle,
+    calculate_distance, is_collision_imminent, preprocess_image,
+    combine_rgb_semantic, safe_float, safe_int, PerformanceMonitor
+)
 
 class TrafficLightState(Enum):
     RED = "red"
@@ -127,7 +135,7 @@ class PerceptionOutput:
 
 class PerceptionSystem:
     """
-    Perception system with improved algorithms and safety focus
+    Perception system with improved algorithms, safety focus, and utility integration
     """
     
     # CARLA semantic segmentation classes
@@ -160,14 +168,25 @@ class PerceptionSystem:
     # Reverse mapping for easier lookup
     CLASS_TO_ID = {v: k for k, v in SEMANTIC_CLASSES.items()}
     
-    def __init__(self, image_width: int = 800, image_height: int = 600):
+    def __init__(self, image_width: int = 800, image_height: int = 600, 
+                 log_level: int = logging.INFO):
+        """
+        Initialize perception system with utility integration
+        """
+        # Setup logging using utils
+        setup_logging(log_level)
+        self.logger = logging.getLogger(__name__)
+        
+        # Performance monitoring
+        self.performance_monitor = PerformanceMonitor()
+        
         self.image_width = image_width
         self.image_height = image_height
         
         # Camera calibration parameters (for distance estimation)
         self.camera_matrix = self._get_default_camera_matrix()
-        self.focal_length = 400.0  # Approximate focal length in pixels
-        self.camera_height = 2.4   # Camera height in meters
+        self.focal_length = safe_float(400.0)  # Using utils safe conversion
+        self.camera_height = safe_float(2.4)   # Camera height in meters
         
         # Traffic light color detection parameters (improved HSV ranges)
         self.color_ranges = {
@@ -177,30 +196,35 @@ class PerceptionSystem:
             'green': [(np.array([40, 120, 70]), np.array([80, 255, 255]))]
         }
         
-        # Object detection parameters
-        self.min_object_area = 100
-        self.min_vehicle_area = 500  # Increased for better filtering
-        self.min_pedestrian_area = 200  # Increased for better filtering
-        self.max_detection_distance = 100.0  # meters
+        # Object detection parameters with safe conversions
+        self.min_object_area = safe_int(100)
+        self.min_vehicle_area = safe_int(500)
+        self.min_pedestrian_area = safe_int(200)
+        self.max_detection_distance = safe_float(100.0)
         
         # Lane detection parameters
-        self.min_lane_pixels = 50
-        self.roi_height_ratio = 0.4  # Focus on relevant area
-        self.lane_width_pixels = 100  # Approximate lane width in pixels
+        self.min_lane_pixels = safe_int(50)
+        self.roi_height_ratio = safe_float(0.4)
+        self.lane_width_pixels = safe_int(100)
         
         # Safety parameters
-        self.safe_following_distance = 15.0  # meters
-        self.emergency_brake_distance = 8.0  # meters
-        self.lane_change_clearance = 20.0   # meters
+        self.safe_following_distance = safe_float(15.0)
+        self.emergency_brake_distance = safe_float(8.0)
+        self.lane_change_clearance = safe_float(20.0)
         
-        # Temporal tracking (simple implementation)
+        # Temporal tracking
         self.object_history = {}
         self.next_track_id = 0
         
+        # Frame counter for performance monitoring
+        self.frame_count = 0
+        
+        self.logger.info("Perception system initialized")
+    
     def _get_default_camera_matrix(self) -> np.ndarray:
-        """Default camera matrix for CARLA setup"""
-        fx = fy = 400.0  # Focal length approximation
-        cx, cy = self.image_width / 2, self.image_height / 2
+        """Default camera matrix for CARLA setup using safe conversions"""
+        fx = fy = safe_float(400.0)
+        cx, cy = safe_float(self.image_width / 2), safe_float(self.image_height / 2)
         return np.array([
             [fx, 0, cx],
             [0, fy, cy],
@@ -210,82 +234,105 @@ class PerceptionSystem:
     def process_sensors(self, sensor_data: Dict[str, Any], frame_id: int = 0, 
                        timestamp: float = 0.0) -> PerceptionOutput:
         """
-        Main processing function with safety focus
+        Main processing function with utility integration and performance monitoring
         """
-        start_time = time.time()
-        
-        # Extract sensor data
-        rgb_image = sensor_data.get('rgb')
-        semantic_image = sensor_data.get('semantic') 
-        depth_image = sensor_data.get('depth')
-        vehicle_speed = sensor_data.get('speed', 0.0)
-        gps_data = sensor_data.get('gps', {})
-        imu_data = sensor_data.get('imu', {})
-        
-        if rgb_image is None or semantic_image is None:
-            return self._empty_perception(frame_id, timestamp)
-        
-        # Assess sensor quality
-        sensor_quality = self._assess_sensor_quality(rgb_image, semantic_image, depth_image)
-        
-        perception = PerceptionOutput(
-            frame_id=frame_id,
-            timestamp=timestamp,
-            sensor_quality=sensor_quality
-        )
-        
-        # Object detection with algorithms
-        all_objects = self._detect_objects(semantic_image, depth_image, rgb_image)
-        
-        # Temporal tracking
-        all_objects = self._update_object_tracking(all_objects)
-        
-        # Categorize objects
-        perception.detected_objects = all_objects
-        perception.vehicles = [obj for obj in all_objects if obj.object_type == ObjectType.VEHICLE]
-        perception.pedestrians = [obj for obj in all_objects if obj.object_type == ObjectType.PEDESTRIAN]
-        perception.obstacles = [obj for obj in all_objects 
-                              if obj.distance < 50.0 and obj.confidence > 0.5]
-        
-        # Lane detection
-        perception.lane_info = self._detect_lanes(semantic_image, rgb_image, depth_image)
-        
-        # Traffic light detection with multiple lights
-        perception.traffic_lights = self._detect_traffic_lights(
-            rgb_image, semantic_image, depth_image
-        )
-        # Set primary traffic light (most relevant)
-        perception.traffic_light = self._get_most_relevant_traffic_light(perception.traffic_lights)
-        
-        # Road analysis
-        perception.drivable_area = self._get_drivable_area(semantic_image)
-        perception.road_ahead_clear = self._is_road_clear(
-            semantic_image, depth_image, perception.obstacles
-        )
-        perception.intersection_ahead = self._detect_intersection(
-            semantic_image, perception.traffic_lights
-        )
-        
-        # Calculate closest vehicle distance
-        if perception.vehicles:
-            perception.closest_vehicle_distance = min(v.distance for v in perception.vehicles)
-        
-        # Safety metrics calculation
-        perception.safety_metrics = self._calculate_safety_metrics(
-            perception.vehicles, perception.pedestrians, perception.lane_info, vehicle_speed
-        )
-        
-        # Speed limit detection
-        perception.speed_limit = self._detect_speed_limit(rgb_image, semantic_image)
-        
-        # Record processing time
-        perception.processing_time = time.time() - start_time
-        
-        return perception
+        # Use Timer context manager from utils
+        with Timer(f"Perception processing frame {frame_id}"):
+            # Update performance monitoring
+            self.performance_monitor.log_frame()
+            self.frame_count += 1
+            
+            # Extract and validate sensor data with safe conversions
+            rgb_image = sensor_data.get('rgb')
+            semantic_image = sensor_data.get('semantic') 
+            depth_image = sensor_data.get('depth')
+            vehicle_speed = safe_float(sensor_data.get('speed', 0.0))
+            gps_data = sensor_data.get('gps', {})
+            imu_data = sensor_data.get('imu', {})
+            
+            if rgb_image is None or semantic_image is None:
+                self.logger.warning(f"Missing essential sensor data for frame {frame_id}")
+                return self._empty_perception(frame_id, timestamp)
+            
+            # Preprocess images using utils function
+            try:
+                # Create combined RGB+semantic visualization for debugging
+                if rgb_image is not None and semantic_image is not None:
+                    combined_viz = combine_rgb_semantic(rgb_image, semantic_image, alpha=0.7)
+                    # This could be saved for debugging if needed
+            except Exception as e:
+                self.logger.warning(f"Failed to create combined visualization: {e}")
+            
+            # Assess sensor quality
+            sensor_quality = self._assess_sensor_quality(rgb_image, semantic_image, depth_image)
+            
+            perception = PerceptionOutput(
+                frame_id=frame_id,
+                timestamp=timestamp,
+                sensor_quality=sensor_quality
+            )
+            
+            # Use debug logging context for detailed processing
+            with LoggingContext(logging.DEBUG, self.logger.name):
+                # Object detection
+                all_objects = self._detect_objects(semantic_image, depth_image, rgb_image)
+                
+                # Temporal tracking
+                all_objects = self._update_object_tracking(all_objects)
+                
+                # Categorize objects with filtering
+                perception.detected_objects = all_objects
+                perception.vehicles = [obj for obj in all_objects if obj.object_type == ObjectType.VEHICLE]
+                perception.pedestrians = [obj for obj in all_objects if obj.object_type == ObjectType.PEDESTRIAN]
+                perception.obstacles = [obj for obj in all_objects 
+                                      if obj.distance < 50.0 and obj.confidence > 0.5]
+                
+                self.logger.debug(f"Detected: {len(perception.vehicles)} vehicles, "
+                                f"{len(perception.pedestrians)} pedestrians, "
+                                f"{len(perception.obstacles)} obstacles")
+            
+            # Lane detection with processing
+            perception.lane_info = self._detect_lanes(semantic_image, rgb_image, depth_image)
+            
+            # Traffic light detection with multiple lights
+            perception.traffic_lights = self._detect_traffic_lights(
+                rgb_image, semantic_image, depth_image
+            )
+            perception.traffic_light = self._get_most_relevant_traffic_light(perception.traffic_lights)
+            
+            # Road analysis
+            perception.drivable_area = self._get_drivable_area(semantic_image)
+            perception.road_ahead_clear = self._is_road_clear(
+                semantic_image, depth_image, perception.obstacles
+            )
+            perception.intersection_ahead = self._detect_intersection(
+                semantic_image, perception.traffic_lights
+            )
+            
+            # Calculate closest vehicle distance with safety clamping
+            if perception.vehicles:
+                closest_distance = min(v.distance for v in perception.vehicles)
+                perception.closest_vehicle_distance = clamp(closest_distance, 0.0, 1000.0)
+            
+            # Safety metrics calculation with collision detection
+            perception.safety_metrics = self._calculate_safety_metrics(
+                perception.vehicles, perception.pedestrians, perception.lane_info, vehicle_speed
+            )
+            
+            # Speed limit detection
+            perception.speed_limit = self._detect_speed_limit(rgb_image, semantic_image)
+            
+            # Log performance metrics periodically
+            if self.frame_count % 100 == 0:
+                stats = self.performance_monitor.get_stats()
+                self.logger.info(f"Perception performance: {stats['avg_fps']:.1f} FPS, "
+                               f"avg frame time: {stats['avg_frame_time']*1000:.1f}ms")
+            
+            return perception
     
     def _detect_objects(self, semantic_image: np.ndarray, depth_image: Optional[np.ndarray],
-                                rgb_image: np.ndarray) -> List[DetectedObject]:
-        """Object detection with better filtering and distance estimation"""
+                       rgb_image: np.ndarray) -> List[DetectedObject]:
+        """Object detection with error handling and validation"""
         detected_objects = []
         
         # Define object class mappings
@@ -298,338 +345,487 @@ class PerceptionSystem:
             for class_id in class_ids:
                 if class_id is None:
                     continue
+                
+                try:
+                    # Create mask for this object type
+                    object_mask = (semantic_image == class_id)
                     
-                # Create mask for this object type
-                object_mask = (semantic_image == class_id)
-                
-                if not np.any(object_mask):
+                    if not np.any(object_mask):
+                        continue
+                    
+                    # Extract objects
+                    objects = self._extract_objects(
+                        object_mask, obj_type, depth_image, rgb_image
+                    )
+                    detected_objects.extend(objects)
+                    
+                except Exception as e:
+                    self.logger.error(f"Error detecting {obj_type.value} objects: {e}")
                     continue
-                
-                # Extract objects using method
-                objects = self._extract_objects(
-                    object_mask, obj_type, depth_image, rgb_image
-                )
-                detected_objects.extend(objects)
         
-        # Filter by distance and confidence
-        detected_objects = [
-            obj for obj in detected_objects 
-            if obj.distance <= self.max_detection_distance and obj.confidence > 0.3
-        ]
+        # Filter by distance and confidence with safe bounds
+        valid_objects = []
+        for obj in detected_objects:
+            if (0.0 <= obj.distance <= self.max_detection_distance and 
+                0.0 <= obj.confidence <= 1.0):
+                valid_objects.append(obj)
         
-        return detected_objects
+        self.logger.debug(f"Detected {len(valid_objects)} valid objects from {len(detected_objects)} raw detections")
+        return valid_objects
     
     def _extract_objects(self, mask: np.ndarray, object_type: ObjectType,
-                                 depth_image: Optional[np.ndarray], 
-                                 rgb_image: np.ndarray) -> List[DetectedObject]:
-        """Object extraction with morphological operations"""
+                        depth_image: Optional[np.ndarray], 
+                        rgb_image: np.ndarray) -> List[DetectedObject]:
+        """Object extraction with morphological operations and validation"""
         objects = []
         
-        # Apply morphological operations to clean up mask
-        kernel = np.ones((3, 3), np.uint8)
-        mask_cleaned = cv2.morphologyEx(mask.astype(np.uint8), cv2.MORPH_CLOSE, kernel)
-        mask_cleaned = cv2.morphologyEx(mask_cleaned, cv2.MORPH_OPEN, kernel)
-        
-        # Use connected components for better object separation
-        num_labels, labels = cv2.connectedComponents(mask_cleaned)
-        
-        for label in range(1, num_labels):  # Skip background
-            component_mask = (labels == label)
-            area = np.sum(component_mask)
+        try:
+            # Apply morphological operations to clean up mask
+            kernel = np.ones((3, 3), np.uint8)
+            mask_cleaned = cv2.morphologyEx(mask.astype(np.uint8), cv2.MORPH_CLOSE, kernel)
+            mask_cleaned = cv2.morphologyEx(mask_cleaned, cv2.MORPH_OPEN, kernel)
             
-            # Filter by minimum area based on object type
-            min_area = self.min_vehicle_area if object_type == ObjectType.VEHICLE else self.min_pedestrian_area
-            if area < min_area:
-                continue
+            # Use connected components for object separation
+            num_labels, labels = cv2.connectedComponents(mask_cleaned)
             
-            # Get bounding box
-            rows, cols = np.where(component_mask)
-            x1, y1 = cols.min(), rows.min()
-            x2, y2 = cols.max(), rows.max()
-            bbox = (x1, y1, x2, y2)
-            
-            # Filter by aspect ratio (basic sanity check)
-            width, height = x2 - x1, y2 - y1
-            aspect_ratio = width / max(height, 1)
-            if object_type == ObjectType.VEHICLE and (aspect_ratio < 0.3 or aspect_ratio > 5.0):
-                continue
-            if object_type == ObjectType.PEDESTRIAN and (aspect_ratio < 0.2 or aspect_ratio > 2.0):
-                continue
-            
-            # Distance calculation
-            distance = self._calculate_object_distance(
-                component_mask, depth_image, bbox, object_type
-            )
-            
-            # Skip very distant or very close (likely noise) objects
-            if distance < 2.0 or distance > self.max_detection_distance:
-                continue
-            
-            # Calculate relative position
-            center_x = (x1 + x2) / 2
-            center_y = (y1 + y2) / 2
-            lateral_pos = (center_x - self.image_width / 2) / (self.image_width / 2)
-            
-            # Convert to real-world coordinates
-            lateral_distance = self._pixel_to_lateral_distance(center_x, distance)
-            
-            # Assign lane based on lateral position
-            lane_assignment = self._assign_lane(lateral_distance)
-            
-            # Confidence calculation
-            confidence = self._calculate_object_confidence(
-                component_mask, depth_image, object_type, bbox
-            )
-            
-            # Motion estimation (placeholder for tracking)
-            is_moving = self._estimate_object_motion(bbox, object_type)
-            
-            detected_object = DetectedObject(
-                object_type=object_type,
-                bbox=bbox,
-                confidence=confidence,
-                distance=distance,
-                relative_position=(lateral_distance, distance),
-                lane_assignment=lane_assignment,
-                size_2d=(width, height),
-                is_moving=is_moving
-            )
-            
-            objects.append(detected_object)
+            for label in range(1, num_labels):  # Skip background
+                component_mask = (labels == label)
+                area = np.sum(component_mask)
+                
+                # Filter by minimum area based on object type
+                min_area = (self.min_vehicle_area if object_type == ObjectType.VEHICLE 
+                           else self.min_pedestrian_area)
+                if area < min_area:
+                    continue
+                
+                # Get bounding box with safe indexing
+                rows, cols = np.where(component_mask)
+                if len(rows) == 0 or len(cols) == 0:
+                    continue
+                    
+                x1, y1 = safe_int(cols.min()), safe_int(rows.min())
+                x2, y2 = safe_int(cols.max()), safe_int(rows.max())
+                
+                # Clamp bounding box to image bounds
+                x1 = clamp(x1, 0, self.image_width - 1)
+                x2 = clamp(x2, 0, self.image_width - 1)
+                y1 = clamp(y1, 0, self.image_height - 1)
+                y2 = clamp(y2, 0, self.image_height - 1)
+                
+                bbox = (x1, y1, x2, y2)
+                
+                # Validate bounding box
+                width, height = x2 - x1, y2 - y1
+                if width <= 0 or height <= 0:
+                    continue
+                
+                # Filter by aspect ratio (basic sanity check)
+                aspect_ratio = safe_float(width) / max(safe_float(height), 1.0)
+                
+                if object_type == ObjectType.VEHICLE:
+                    if not (0.3 <= aspect_ratio <= 5.0):
+                        continue
+                elif object_type == ObjectType.PEDESTRIAN:
+                    if not (0.2 <= aspect_ratio <= 2.0):
+                        continue
+                
+                # Distance calculation with error handling
+                distance = self._calculate_object_distance(
+                    component_mask, depth_image, bbox, object_type
+                )
+                
+                # Skip very distant or very close (likely noise) objects
+                if distance < 2.0 or distance > self.max_detection_distance:
+                    continue
+                
+                # Calculate relative position with safe conversions
+                center_x = safe_float((x1 + x2) / 2)
+                center_y = safe_float((y1 + y2) / 2)
+                
+                # Convert to real-world coordinates
+                lateral_distance = self._pixel_to_lateral_distance(center_x, distance)
+                
+                # Assign lane based on lateral position
+                lane_assignment = self._assign_lane(lateral_distance)
+                
+                # Confidence calculation
+                confidence = self._calculate_object_confidence(
+                    component_mask, depth_image, object_type, bbox
+                )
+                
+                # Motion estimation
+                is_moving = self._estimate_object_motion(bbox, object_type)
+                
+                detected_object = DetectedObject(
+                    object_type=object_type,
+                    bbox=bbox,
+                    confidence=clamp(confidence, 0.0, 1.0),
+                    distance=clamp(distance, 0.0, self.max_detection_distance),
+                    relative_position=(lateral_distance, distance),
+                    lane_assignment=lane_assignment,
+                    size_2d=(safe_float(width), safe_float(height)),
+                    is_moving=is_moving
+                )
+                
+                objects.append(detected_object)
+                
+        except Exception as e:
+            self.logger.error(f"Error in object extraction for {object_type.value}: {e}")
         
         return objects
     
-    def _detect_lanes(self, semantic_image: np.ndarray, 
-                              rgb_image: np.ndarray,
-                              depth_image: Optional[np.ndarray]) -> Optional[LaneInfo]:
-        """Lane detection with better polynomial fitting and validation"""
-        # Get road and roadline masks
-        road_mask = (semantic_image == self.CLASS_TO_ID.get('road', 7))
-        roadline_mask = (semantic_image == self.CLASS_TO_ID.get('roadline', 6))
-        
-        if not np.any(roadline_mask):
-            return None
-        
-        # ROI selection - perspective-aware
-        roi_mask = self._create_lane_roi_mask()
-        roadline_roi = roadline_mask & roi_mask
-        
-        if np.sum(roadline_roi) < self.min_lane_pixels:
-            return None
-        
-        lane_info = LaneInfo()
-        
-        # Lane boundary extraction
-        left_boundary, right_boundary, left_pixels, right_pixels = self._extract_lane_boundaries(
-            roadline_roi
-        )
-        
-        lane_info.left_boundary = left_boundary
-        lane_info.right_boundary = right_boundary
-        lane_info.left_lane_pixels = left_pixels
-        lane_info.right_lane_pixels = right_pixels
-        
-        # Calculate metrics
-        if left_boundary is not None or right_boundary is not None:
-            lane_info.lane_width = self._calculate_lane_width(
-                left_boundary, right_boundary, depth_image
-            )
-            lane_info.curvature = self._calculate_curvature(left_boundary, right_boundary)
-            lane_info.center_line = self._calculate_center_line(
-                left_boundary, right_boundary, lane_info.lane_width
-            )
-            lane_info.heading_angle = self._calculate_heading_angle(lane_info.center_line)
-            
-            # Lane departure detection
-            lane_info.lane_departure_left, lane_info.lane_departure_right, lane_info.lane_center_offset = \
-                self._detect_lane_departure(lane_info.center_line, lane_info.lane_width)
-            
-            # Lane type classification
-            lane_info.lane_type_left, lane_info.lane_type_right = self._classify_lane_types(
-                rgb_image, left_boundary, right_boundary, left_pixels, right_pixels
-            )
-            
-            # Confidence calculation
-            lane_info.confidence = self._calculate_lane_confidence(
-                roadline_roi, left_boundary, right_boundary, left_pixels, right_pixels
-            )
-        
-        return lane_info
-    
-    def _detect_traffic_lights(self, rgb_image: np.ndarray, semantic_image: np.ndarray,
-                                       depth_image: Optional[np.ndarray]) -> List[TrafficLightInfo]:
-        """Traffic light detection with multiple lights and relevance scoring"""
-        traffic_lights = []
-        
-        # Find traffic light regions
-        traffic_light_mask = (semantic_image == self.CLASS_TO_ID.get('traffic_light', 18))
-        
-        if not np.any(traffic_light_mask):
-            return traffic_lights
-        
-        # Get connected components for multiple traffic lights
-        mask_uint8 = traffic_light_mask.astype(np.uint8) * 255
-        contours, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        for contour in contours:
-            area = cv2.contourArea(contour)
-            if area < 100:  # Minimum size threshold
-                continue
+    def _calculate_object_distance(self, mask: np.ndarray, depth_image: Optional[np.ndarray],
+                                  bbox: Tuple[int, int, int, int], 
+                                  object_type: ObjectType) -> float:
+        """Distance calculation with fallbacks and validation"""
+        if depth_image is not None:
+            try:
+                object_depths = depth_image[mask]
+                # Filter for valid depth values with more robust bounds
+                valid_depths = object_depths[
+                    (object_depths > 1.0) & 
+                    (object_depths < 200.0) & 
+                    np.isfinite(object_depths)
+                ]
                 
-            x, y, w, h = cv2.boundingRect(contour)
-            bbox = (x, y, x + w, y + h)
-            
-            # ROI extraction with padding
-            padding = 5
-            x_start = max(0, x - padding)
-            y_start = max(0, y - padding)
-            x_end = min(rgb_image.shape[1], x + w + padding)
-            y_end = min(rgb_image.shape[0], y + h + padding)
-            
-            tl_roi = rgb_image[y_start:y_end, x_start:x_end]
-            
-            if tl_roi.size == 0:
-                continue
-            
-            # Color classification
-            state, color_confidence = self._classify_traffic_light_color(tl_roi)
-            
-            if color_confidence < 0.3:  # Skip low confidence detections
-                continue
-            
-            # Distance calculation
-            distance = self._calculate_traffic_light_distance(
-                x, y, w, h, depth_image
-            )
-            
-            # Determine relevance for ego vehicle
-            relevant_for_ego = self._is_traffic_light_relevant(x, y, w, h, distance)
-            
-            traffic_light_info = TrafficLightInfo(
-                state=state,
-                distance=distance,
-                confidence=color_confidence,
-                bbox=bbox,
-                relevant_for_ego=relevant_for_ego
-            )
-            
-            traffic_lights.append(traffic_light_info)
+                if len(valid_depths) > 10:
+                    # Use percentile instead of median for outlier handling
+                    distance = float(np.percentile(valid_depths, 50))  # Median
+                    if 2.0 <= distance <= self.max_detection_distance:
+                        return distance
+            except Exception as e:
+                self.logger.debug(f"Depth-based distance calculation failed: {e}")
         
-        # Sort by distance (closest first)
-        traffic_lights.sort(key=lambda tl: tl.distance)
+        # Estimate from bounding box size with object-specific parameters
+        x1, y1, x2, y2 = bbox
+        height = safe_float(y2 - y1)
         
-        return traffic_lights
+        # Object-specific size assumptions (more realistic)
+        if object_type == ObjectType.VEHICLE:
+            # Assume vehicle height ~1.6m (average car height)
+            estimated_object_height = 1.6
+        else:  # Pedestrian
+            # Assume pedestrian height ~1.7m
+            estimated_object_height = 1.7
+        
+        # Distance calculation considering camera angle
+        if height > 1:
+            distance = (estimated_object_height * self.focal_length) / height
+            # Apply perspective correction (objects lower in image are closer)
+            y_center = safe_float((y1 + y2) / 2)
+            perspective_factor = 1.0 + (y_center - self.image_height / 2) / self.image_height * 0.2
+            distance *= perspective_factor
+        else:
+            distance = 50.0  # Default distance for very small objects
+        
+        # Clamp to reasonable bounds with safety margins
+        return clamp(distance, 3.0, 150.0)
     
     def _calculate_safety_metrics(self, vehicles: List[DetectedObject], 
                                  pedestrians: List[DetectedObject],
                                  lane_info: Optional[LaneInfo],
                                  ego_speed: float) -> SafetyMetrics:
-        """Calculate comprehensive safety metrics for rule-based decisions"""
+        """Safety metrics calculation using utility functions"""
         safety = SafetyMetrics()
+        
+        # Convert ego vehicle position for collision detection
+        ego_position_2d = (self.image_width / 2, self.image_height)  # Bottom center
         
         # Collision risk assessment
         for vehicle in vehicles:
-            if vehicle.distance < self.emergency_brake_distance:
+            # Use utility function for collision imminence check
+            vehicle_2d_pos = ((vehicle.bbox[0] + vehicle.bbox[2]) / 2, 
+                             (vehicle.bbox[1] + vehicle.bbox[3]) / 2)
+            
+            # Convert to world coordinates (simplified)
+            obstacle_locations = [type('Location', (), {'x': vehicle.relative_position[0], 
+                                                       'y': vehicle.relative_position[1]})()]
+            ego_location = type('Location', (), {'x': 0.0, 'y': 0.0})()
+            
+            # Check collision imminence using utils function
+            if is_collision_imminent(ego_location, obstacle_locations, 
+                                   threshold=self.emergency_brake_distance):
                 safety.emergency_brake_needed = True
                 safety.collision_risk_front = 1.0
             elif vehicle.distance < self.safe_following_distance:
+                # Calculate risk with smooth falloff
                 risk = 1.0 - (vehicle.distance / self.safe_following_distance)
-                safety.collision_risk_front = max(safety.collision_risk_front, risk)
+                safety.collision_risk_front = max(safety.collision_risk_front, clamp(risk, 0.0, 1.0))
             
-            # Update following distance
+            # Update following distance for same-lane vehicles
             if vehicle.lane_assignment == 0:  # Same lane
                 safety.following_distance = min(safety.following_distance, vehicle.distance)
         
-        # Pedestrian risk
+        # Pedestrian risk assessment
         for pedestrian in pedestrians:
-            if pedestrian.distance < 10.0:  # Close pedestrian
+            if pedestrian.distance < 10.0:  # Close pedestrian threshold
+                risk_level = 1.0 - (pedestrian.distance / 10.0)  # Linear falloff
+                risk_level = clamp(risk_level * 0.8, 0.0, 1.0)  # Scale down slightly
+                
                 if pedestrian.relative_position[0] < 0:  # Left side
-                    safety.collision_risk_left = max(safety.collision_risk_left, 0.8)
+                    safety.collision_risk_left = max(safety.collision_risk_left, risk_level)
                 else:  # Right side
-                    safety.collision_risk_right = max(safety.collision_risk_right, 0.8)
+                    safety.collision_risk_right = max(safety.collision_risk_right, risk_level)
         
         # Time to collision calculation
-        front_vehicles = [v for v in vehicles if v.lane_assignment == 0 and v.distance < 50.0]
+        front_vehicles = [v for v in vehicles 
+                         if v.lane_assignment == 0 and v.distance < 50.0]
+        
         if front_vehicles and ego_speed > 1.0:
             closest_vehicle = min(front_vehicles, key=lambda v: v.distance)
-            relative_speed = ego_speed - closest_vehicle.relative_speed
+            # Assume relative speed (in real system, this would be tracked)
+            relative_speed = max(ego_speed - closest_vehicle.relative_speed, 0.1)
             if relative_speed > 0:
-                safety.time_to_collision = closest_vehicle.distance / relative_speed
+                safety.time_to_collision = clamp(
+                    closest_vehicle.distance / relative_speed, 
+                    0.0, 30.0  # Cap at 30 seconds
+                )
         
-        # Lane change safety
+        # Lane change safety with distance calculations
         left_vehicles = [v for v in vehicles if v.lane_assignment == -1]
         right_vehicles = [v for v in vehicles if v.lane_assignment == 1]
         
+        # More sophisticated lane change safety considering relative speeds
         safety.safe_to_change_left = all(
-            v.distance > self.lane_change_clearance for v in left_vehicles
+            v.distance > self.lane_change_clearance or 
+            (v.distance > 10.0 and abs(v.relative_speed - ego_speed) < 10.0)
+            for v in left_vehicles
         )
+        
         safety.safe_to_change_right = all(
-            v.distance > self.lane_change_clearance for v in right_vehicles
+            v.distance > self.lane_change_clearance or 
+            (v.distance > 10.0 and abs(v.relative_speed - ego_speed) < 10.0)
+            for v in right_vehicles
         )
+        
+        # Clamp all risk values to valid range
+        safety.collision_risk_front = clamp(safety.collision_risk_front, 0.0, 1.0)
+        safety.collision_risk_left = clamp(safety.collision_risk_left, 0.0, 1.0)
+        safety.collision_risk_right = clamp(safety.collision_risk_right, 0.0, 1.0)
         
         return safety
     
-    # Helper methods
-    def _calculate_object_distance(self, mask: np.ndarray, depth_image: Optional[np.ndarray],
-                                          bbox: Tuple[int, int, int, int], 
-                                          object_type: ObjectType) -> float:
-        """Distance calculation with fallback methods"""
-        if depth_image is not None:
-            object_depths = depth_image[mask]
-            valid_depths = object_depths[(object_depths > 1.0) & (object_depths < 200.0)]
-            
-            if len(valid_depths) > 10:
-                # Use median for robustness
-                distance = float(np.median(valid_depths))
-                if 2.0 <= distance <= self.max_detection_distance:
-                    return distance
-        
-        # Fallback: estimate from bounding box size
-        x1, y1, x2, y2 = bbox
-        height = y2 - y1
-        
-        # Rough approximation based on typical object sizes
-        if object_type == ObjectType.VEHICLE:
-            # Assume vehicle height ~1.8m
-            distance = (1.8 * self.focal_length) / max(height, 1)
-        else:  # Pedestrian
-            # Assume pedestrian height ~1.7m
-            distance = (1.7 * self.focal_length) / max(height, 1)
-        
-        return max(5.0, min(distance, 100.0))  # Reasonable bounds
-    
     def _pixel_to_lateral_distance(self, pixel_x: float, distance: float) -> float:
-        """Convert pixel coordinate to lateral distance in meters"""
-        # Simple pinhole camera model
-        lateral_angle = (pixel_x - self.image_width / 2) / self.focal_length
-        lateral_distance = distance * np.tan(lateral_angle)
-        return float(lateral_distance)
+        """Pixel to lateral distance conversion with clamping"""
+        try:
+            # Simple pinhole camera model
+            lateral_angle = (pixel_x - self.image_width / 2) / self.focal_length
+            lateral_distance = distance * np.tan(lateral_angle)
+            # Clamp to reasonable lateral bounds (±20m from vehicle center)
+            return clamp(float(lateral_distance), -20.0, 20.0)
+        except Exception as e:
+            self.logger.debug(f"Lateral distance calculation failed: {e}")
+            return 0.0
     
     def _assign_lane(self, lateral_distance: float) -> int:
-        """Lane assignment based on real-world distance"""
-        # Assume ~3.7m lane width
-        if lateral_distance < -1.85:
+        """Lane assignment with configurable lane width"""
+        # Use more precise lane width (3.7m is US standard)
+        lane_half_width = 1.85  # meters
+        
+        lateral_distance = safe_float(lateral_distance)
+        
+        if lateral_distance < -lane_half_width:
             return -1  # Left lane
-        elif lateral_distance > 1.85:
+        elif lateral_distance > lane_half_width:
             return 1   # Right lane
         else:
             return 0   # Same lane
     
+    def _detect_lanes(self, semantic_image: np.ndarray, 
+                     rgb_image: np.ndarray,
+                     depth_image: Optional[np.ndarray]) -> Optional[LaneInfo]:
+        """Lane detection with error handling"""
+        try:
+            # Get road and roadline masks with safe class ID lookup
+            road_class_id = self.CLASS_TO_ID.get('road', 7)
+            roadline_class_id = self.CLASS_TO_ID.get('roadline', 6)
+            
+            road_mask = (semantic_image == road_class_id)
+            roadline_mask = (semantic_image == roadline_class_id)
+            
+            if not np.any(roadline_mask):
+                self.logger.debug("No roadline pixels detected")
+                return None
+            
+            # ROI selection
+            roi_mask = self._create_lane_roi_mask()
+            roadline_roi = roadline_mask & roi_mask
+            
+            if np.sum(roadline_roi) < self.min_lane_pixels:
+                self.logger.debug(f"Insufficient lane pixels: {np.sum(roadline_roi)} < {self.min_lane_pixels}")
+                return None
+            
+            lane_info = LaneInfo()
+            
+            # Lane boundary extraction
+            left_boundary, right_boundary, left_pixels, right_pixels = self._extract_lane_boundaries(
+                roadline_roi
+            )
+            
+            lane_info.left_boundary = left_boundary
+            lane_info.right_boundary = right_boundary
+            lane_info.left_lane_pixels = left_pixels
+            lane_info.right_lane_pixels = right_pixels
+            
+            # Calculate metrics
+            if left_boundary is not None or right_boundary is not None:
+                lane_info.lane_width = self._calculate_lane_width(
+                    left_boundary, right_boundary, depth_image
+                )
+                lane_info.curvature = self._calculate_curvature(left_boundary, right_boundary)
+                lane_info.center_line = self._calculate_center_line(
+                    left_boundary, right_boundary, lane_info.lane_width
+                )
+                
+                # Heading angle calculation with angle normalization
+                raw_heading = self._calculate_heading_angle(lane_info.center_line)
+                lane_info.heading_angle = normalize_angle(raw_heading)
+                
+                # Lane departure detection
+                lane_info.lane_departure_left, lane_info.lane_departure_right, lane_info.lane_center_offset = \
+                    self._detect_lane_departure(lane_info.center_line, lane_info.lane_width)
+                
+                # Lane type classification
+                lane_info.lane_type_left, lane_info.lane_type_right = self._classify_lane_types(
+                    rgb_image, left_boundary, right_boundary, left_pixels, right_pixels
+                )
+                
+                # Confidence calculation
+                lane_info.confidence = self._calculate_lane_confidence(
+                    roadline_roi, left_boundary, right_boundary, left_pixels, right_pixels
+                )
+            
+            return lane_info
+            
+        except Exception as e:
+            self.logger.error(f"Lane detection failed: {e}")
+            return None
+    
+    def _detect_traffic_lights(self, rgb_image: np.ndarray, semantic_image: np.ndarray,
+                              depth_image: Optional[np.ndarray]) -> List[TrafficLightInfo]:
+        """Traffic light detection with error handling"""
+        traffic_lights = []
+        
+        try:
+            # Find traffic light regions with safe class lookup
+            traffic_light_class_id = self.CLASS_TO_ID.get('traffic_light', 18)
+            traffic_light_mask = (semantic_image == traffic_light_class_id)
+            
+            if not np.any(traffic_light_mask):
+                return traffic_lights
+            
+            # Get connected components for multiple traffic lights
+            mask_uint8 = traffic_light_mask.astype(np.uint8) * 255
+            contours, _ = cv2.findContours(mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            for contour in contours:
+                try:
+                    area = cv2.contourArea(contour)
+                    if area < 100:  # Minimum size threshold
+                        continue
+                        
+                    x, y, w, h = cv2.boundingRect(contour)
+                    
+                    # Clamp bounding box to image bounds
+                    x = clamp(x, 0, rgb_image.shape[1] - 1)
+                    y = clamp(y, 0, rgb_image.shape[0] - 1)
+                    w = clamp(w, 1, rgb_image.shape[1] - x)
+                    h = clamp(h, 1, rgb_image.shape[0] - y)
+                    
+                    bbox = (x, y, x + w, y + h)
+                    
+                    # ROI extraction with safe padding
+                    padding = 5
+                    x_start = clamp(x - padding, 0, rgb_image.shape[1])
+                    y_start = clamp(y - padding, 0, rgb_image.shape[0])
+                    x_end = clamp(x + w + padding, 0, rgb_image.shape[1])
+                    y_end = clamp(y + h + padding, 0, rgb_image.shape[0])
+                    
+                    if x_end <= x_start or y_end <= y_start:
+                        continue
+                        
+                    tl_roi = rgb_image[y_start:y_end, x_start:x_end]
+                    
+                    if tl_roi.size == 0:
+                        continue
+                    
+                    # Color classification
+                    state, color_confidence = self._classify_traffic_light_color(tl_roi)
+                    
+                    if color_confidence < 0.3:  # Skip low confidence detections
+                        continue
+                    
+                    # Distance calculation
+                    distance = self._calculate_traffic_light_distance(x, y, w, h, depth_image)
+                    distance = clamp(distance, 5.0, 200.0)  # Reasonable bounds
+                    
+                    # Determine relevance for ego vehicle
+                    relevant_for_ego = self._is_traffic_light_relevant(x, y, w, h, distance)
+                    
+                    traffic_light_info = TrafficLightInfo(
+                        state=state,
+                        distance=distance,
+                        confidence=clamp(color_confidence, 0.0, 1.0),
+                        bbox=bbox,
+                        relevant_for_ego=relevant_for_ego
+                    )
+                    
+                    traffic_lights.append(traffic_light_info)
+                    
+                except Exception as e:
+                    self.logger.debug(f"Error processing traffic light contour: {e}")
+                    continue
+            
+            # Sort by distance (closest first)
+            traffic_lights.sort(key=lambda tl: tl.distance)
+            
+        except Exception as e:
+            self.logger.error(f"Traffic light detection failed: {e}")
+        
+        return traffic_lights
+    
+    def _get_drivable_area(self, semantic_image: np.ndarray) -> Optional[np.ndarray]:
+        """Drivable area detection with error handling"""
+        try:
+            # Get road class ID safely
+            road_class_id = self.CLASS_TO_ID.get('road', 7)
+            drivable_mask = (semantic_image == road_class_id)
+            
+            # Apply morphological operations for cleaner result
+            kernel = np.ones((5, 5), np.uint8)
+            drivable_area = cv2.morphologyEx(
+                drivable_mask.astype(np.uint8), 
+                cv2.MORPH_CLOSE, 
+                kernel
+            )
+            
+            return drivable_area
+            
+        except Exception as e:
+            self.logger.error(f"Drivable area detection failed: {e}")
+            return np.zeros((self.image_height, self.image_width), dtype=np.uint8)
+    
     def _create_lane_roi_mask(self) -> np.ndarray:
-        """Create perspective-aware ROI mask for lane detection"""
+        """ROI mask creation with safer bounds"""
         mask = np.zeros((self.image_height, self.image_width), dtype=bool)
         
-        # Trapezoidal ROI considering perspective
-        bottom_width = self.image_width
-        top_width = int(self.image_width * 0.6)
-        height_start = int(self.image_height * 0.4)
-        
-        for y in range(height_start, self.image_height):
-            progress = (y - height_start) / (self.image_height - height_start)
-            width = int(top_width + (bottom_width - top_width) * progress)
-            x_start = (self.image_width - width) // 2
-            x_end = x_start + width
-            mask[y, x_start:x_end] = True
+        try:
+            # Trapezoidal ROI considering perspective with safe conversions
+            bottom_width = self.image_width
+            top_width = safe_int(self.image_width * 0.6)
+            height_start = safe_int(self.image_height * 0.4)
+            
+            for y in range(height_start, self.image_height):
+                progress = safe_float(y - height_start) / max(self.image_height - height_start, 1)
+                width = safe_int(top_width + (bottom_width - top_width) * progress)
+                x_start = clamp((self.image_width - width) // 2, 0, self.image_width)
+                x_end = clamp(x_start + width, 0, self.image_width)
+                
+                if x_end > x_start:
+                    mask[y, x_start:x_end] = True
+                    
+        except Exception as e:
+            self.logger.error(f"ROI mask creation failed: {e}")
         
         return mask
     
@@ -637,39 +833,44 @@ class PerceptionSystem:
         Optional[np.ndarray], Optional[np.ndarray], 
         Optional[np.ndarray], Optional[np.ndarray]
     ]:
-        """Lane boundary extraction with better separation"""
-        rows, cols = np.where(roadline_roi)
-        
-        if len(cols) < self.min_lane_pixels:
+        """Lane boundary extraction with error handling"""
+        try:
+            rows, cols = np.where(roadline_roi)
+            
+            if len(cols) < self.min_lane_pixels:
+                return None, None, None, None
+            
+            # Use image center for initial separation with safe conversion
+            img_center = safe_int(roadline_roi.shape[1] // 2)
+            
+            # Separate left and right with some overlap handling
+            left_mask = cols < img_center + 50  # Allow some overlap
+            right_mask = cols > img_center - 50
+            
+            left_boundary = None
+            right_boundary = None
+            left_pixels = None
+            right_pixels = None
+            
+            # Fit polynomials to lane boundaries with validation
+            if np.sum(left_mask) > 20:
+                left_points = np.column_stack((cols[left_mask], rows[left_mask]))
+                left_pixels = left_points
+                left_boundary = self._fit_lane_polynomial(left_points)
+            
+            if np.sum(right_mask) > 20:
+                right_points = np.column_stack((cols[right_mask], rows[right_mask]))
+                right_pixels = right_points
+                right_boundary = self._fit_lane_polynomial(right_points)
+            
+            return left_boundary, right_boundary, left_pixels, right_pixels
+            
+        except Exception as e:
+            self.logger.error(f"Lane boundary extraction failed: {e}")
             return None, None, None, None
-        
-        # Use image center for initial separation
-        img_center = roadline_roi.shape[1] // 2
-        
-        # Separate left and right with some overlap handling
-        left_mask = cols < img_center + 50  # Allow some overlap
-        right_mask = cols > img_center - 50
-        
-        left_boundary = None
-        right_boundary = None
-        left_pixels = None
-        right_pixels = None
-        
-        # Fit polynomials to lane boundaries
-        if np.sum(left_mask) > 20:
-            left_points = np.column_stack((cols[left_mask], rows[left_mask]))
-            left_pixels = left_points
-            left_boundary = self._fit_lane_polynomial(left_points)
-        
-        if np.sum(right_mask) > 20:
-            right_points = np.column_stack((cols[right_mask], rows[right_mask]))
-            right_pixels = right_points
-            right_boundary = self._fit_lane_polynomial(right_points)
-        
-        return left_boundary, right_boundary, left_pixels, right_pixels
     
     def _fit_lane_polynomial(self, points: np.ndarray, degree: int = 2) -> Optional[np.ndarray]:
-        """Polynomial fitting with RANSAC-like robustness"""
+        """Polynomial fitting with validation"""
         if len(points) < degree + 1:
             return None
         
@@ -677,608 +878,1287 @@ class PerceptionSystem:
             best_poly = None
             best_score = 0
             
-            # Multiple attempts for robust fitting
-            for attempt in range(10):
+            # Multiple attempts for robust fitting with scoring
+            attempts = min(10, len(points) // 10)  # Adaptive number of attempts
+            
+            for attempt in range(max(attempts, 3)):
                 # Sample subset of points
-                n_sample = min(len(points), max(50, len(points) // 3))
-                sample_indices = np.random.choice(len(points), n_sample, replace=False)
-                sample_points = points[sample_indices]
+                n_sample = clamp(
+                    max(50, len(points) // 3), 
+                    degree + 1, 
+                    len(points)
+                )
                 
-                # Fit polynomial
-                poly = np.polyfit(sample_points[:, 1], sample_points[:, 0], degree)
+                if n_sample >= len(points):
+                    sample_points = points
+                else:
+                    sample_indices = np.random.choice(len(points), n_sample, replace=False)
+                    sample_points = points[sample_indices]
                 
-                # Evaluate quality
-                predicted_x = np.polyval(poly, points[:, 1])
-                errors = np.abs(predicted_x - points[:, 0])
-                inliers = np.sum(errors < 10.0)  # 10 pixel threshold
-                avg_error = np.mean(errors[errors < 10.0]) if inliers > 0 else float('inf')
-                
-                # Score combines inlier count and accuracy
-                score = inliers - avg_error * 0.1
-                
-                if score > best_score:
-                    best_score = score
-                    best_poly = poly
+                # Fit polynomial with error handling
+                try:
+                    poly = np.polyfit(sample_points[:, 1], sample_points[:, 0], degree)
+                    
+                    # Quality evaluation
+                    predicted_x = np.polyval(poly, points[:, 1])
+                    errors = np.abs(predicted_x - points[:, 0])
+                    
+                    # Use multiple thresholds for assessment
+                    inliers_strict = np.sum(errors < 5.0)   # 5 pixel threshold
+                    inliers_loose = np.sum(errors < 15.0)   # 15 pixel threshold
+                    
+                    valid_errors = errors[errors < 15.0]
+                    avg_error = np.mean(valid_errors) if len(valid_errors) > 0 else float('inf')
+                    
+                    # Scoring considering multiple factors
+                    score = (inliers_strict * 2.0 + inliers_loose * 1.0 - 
+                            avg_error * 0.2 - np.std(errors) * 0.1)
+                    
+                    if score > best_score and inliers_strict > len(points) * 0.3:
+                        best_score = score
+                        best_poly = poly
+                        
+                except np.linalg.LinAlgError:
+                    continue
+                except Exception as e:
+                    self.logger.debug(f"Polynomial fitting attempt {attempt} failed: {e}")
+                    continue
             
             return best_poly if best_score > 0 else None
             
-        except Exception:
+        except Exception as e:
+            self.logger.error(f"Polynomial fitting failed: {e}")
             return None
     
     def _calculate_lane_width(self, left_boundary: Optional[np.ndarray], 
-                                     right_boundary: Optional[np.ndarray],
-                                     depth_image: Optional[np.ndarray]) -> float:
-        """Lane width calculation using depth information"""
+                             right_boundary: Optional[np.ndarray],
+                             depth_image: Optional[np.ndarray]) -> float:
+        """Lane width calculation with error handling"""
         if left_boundary is None or right_boundary is None:
             return 3.7  # Standard lane width
         
-        # Sample multiple y positions for robust measurement
-        y_positions = np.linspace(self.image_height * 0.6, self.image_height - 20, 10)
-        widths = []
-        
-        for y in y_positions:
-            try:
-                left_x = np.polyval(left_boundary, y)
-                right_x = np.polyval(right_boundary, y)
-                width_pixels = abs(right_x - left_x)
-                
-                # Convert to meters using depth information if available
-                if depth_image is not None and 0 <= int(y) < depth_image.shape[0]:
-                    # Sample depth at lane boundaries
-                    left_depth = depth_image[int(y), int(max(0, min(left_x, self.image_width-1)))]
-                    right_depth = depth_image[int(y), int(max(0, min(right_x, self.image_width-1)))]
-                    avg_depth = (left_depth + right_depth) / 2
+        try:
+            # Sample multiple y positions for robust measurement
+            y_start = safe_float(self.image_height * 0.6)
+            y_end = safe_float(self.image_height - 20)
+            y_positions = np.linspace(y_start, y_end, 10)
+            
+            widths = []
+            
+            for y in y_positions:
+                try:
+                    left_x = np.polyval(left_boundary, y)
+                    right_x = np.polyval(right_boundary, y)
+                    width_pixels = abs(right_x - left_x)
                     
-                    if avg_depth > 0:
-                        # Convert pixel width to meters using depth
-                        meters_per_pixel = avg_depth / self.focal_length
-                        width_meters = width_pixels * meters_per_pixel
-                        widths.append(width_meters)
-                else:
-                    # Fallback: rough approximation
-                    # Assume perspective scaling - closer = wider in pixels
-                    estimated_depth = 50.0 - (y - self.image_height * 0.6) * 0.5
-                    meters_per_pixel = estimated_depth / self.focal_length
-                    width_meters = width_pixels * meters_per_pixel * 0.01  # Calibration factor
-                    widths.append(width_meters)
-                    
-            except:
-                continue
-        
-        if widths:
-            median_width = np.median(widths)
-            # Sanity check - typical lane width 3.0-4.0m
-            return max(2.5, min(median_width, 5.0))
-        
-        return 3.7
+                    # Distance-to-meters conversion
+                    if depth_image is not None and 0 <= int(y) < depth_image.shape[0]:
+                        # Sample depth at lane boundaries with bounds checking
+                        left_x_int = clamp(int(left_x), 0, self.image_width - 1)
+                        right_x_int = clamp(int(right_x), 0, self.image_width - 1)
+                        y_int = clamp(int(y), 0, self.image_height - 1)
+                        
+                        left_depth = safe_float(depth_image[y_int, left_x_int])
+                        right_depth = safe_float(depth_image[y_int, right_x_int])
+                        
+                        if left_depth > 0 and right_depth > 0:
+                            avg_depth = (left_depth + right_depth) / 2.0
+                            
+                            # Pixel-to-meter conversion
+                            meters_per_pixel = avg_depth / self.focal_length
+                            width_meters = width_pixels * meters_per_pixel
+                            
+                            # Sanity check for reasonable lane width
+                            if 2.0 <= width_meters <= 6.0:
+                                widths.append(width_meters)
+                    else:
+                        # Fallback approximation
+                        estimated_depth = 50.0 - (y - y_start) * 0.5
+                        meters_per_pixel = estimated_depth / self.focal_length
+                        width_meters = width_pixels * meters_per_pixel * 0.01
+                        
+                        if 2.0 <= width_meters <= 6.0:
+                            widths.append(width_meters)
+                            
+                except Exception as e:
+                    self.logger.debug(f"Width calculation failed for y={y}: {e}")
+                    continue
+            
+            if widths:
+                # Use median for robustness and clamp to reasonable bounds
+                median_width = safe_float(np.median(widths))
+                return clamp(median_width, 2.5, 5.0)
+            
+            return 3.7  # Default standard lane width
+            
+        except Exception as e:
+            self.logger.error(f"Lane width calculation failed: {e}")
+            return 3.7
     
     def _detect_lane_departure(self, center_line: Optional[np.ndarray], 
                               lane_width: float) -> Tuple[bool, bool, float]:
-        """Detect lane departure and calculate offset from center"""
+        """Lane departure detection with error handling"""
         if center_line is None:
             return False, False, 0.0
         
-        # Check vehicle position relative to lane center at bottom of image
-        y_check = self.image_height - 50
         try:
+            # Check vehicle position relative to lane center at bottom of image
+            y_check = safe_float(self.image_height - 50)
+            
             lane_center_x = np.polyval(center_line, y_check)
-            vehicle_center_x = self.image_width / 2
+            vehicle_center_x = safe_float(self.image_width / 2)
             
             # Convert pixel offset to meters
             pixel_offset = vehicle_center_x - lane_center_x
-            # Rough conversion (needs calibration)
-            meter_offset = pixel_offset * 0.01  # Approximate
             
-            # Lane departure thresholds (half lane width minus vehicle width margin)
-            departure_threshold = (lane_width / 2) - 0.5  # 0.5m margin
+            # Pixel-to-meter conversion (rough approximation)
+            # This should be calibrated based on camera parameters
+            estimated_distance = 10.0  # Assume 10m ahead for ground plane
+            meters_per_pixel = estimated_distance / self.focal_length
+            meter_offset = pixel_offset * meters_per_pixel * 0.02  # Calibration factor
+            
+            # Clamp offset to reasonable bounds
+            meter_offset = clamp(meter_offset, -10.0, 10.0)
+            
+            # Departure thresholds with safety margin
+            departure_threshold = clamp((lane_width / 2) - 0.5, 1.0, 3.0)  # 0.5m safety margin
             
             left_departure = meter_offset < -departure_threshold
             right_departure = meter_offset > departure_threshold
             
             return left_departure, right_departure, meter_offset
             
-        except:
+        except Exception as e:
+            self.logger.error(f"Lane departure detection failed: {e}")
             return False, False, 0.0
     
     def _classify_traffic_light_color(self, tl_roi: np.ndarray) -> Tuple[TrafficLightState, float]:
-        """Traffic light color classification with better filtering"""
+        """Traffic light color classification with preprocessing"""
         if tl_roi.size == 0 or tl_roi.shape[0] < 10 or tl_roi.shape[1] < 10:
             return TrafficLightState.UNKNOWN, 0.0
         
-        # Preprocessing for better color detection
-        # Apply Gaussian blur to reduce noise
-        blurred = cv2.GaussianBlur(tl_roi, (3, 3), 0)
-        
-        # Convert to HSV
-        hsv = cv2.cvtColor(blurred, cv2.COLOR_RGB2HSV)
-        
-        # Test each color with improved scoring
-        color_scores = {}
-        color_pixels = {}
-        
-        for color_name, ranges in self.color_ranges.items():
-            total_pixels = 0
-            total_intensity = 0
-            
-            for lower, upper in ranges:
-                mask = cv2.inRange(hsv, lower, upper)
-                pixel_count = np.sum(mask > 0)
-                total_pixels += pixel_count
-                
-                # Weight by intensity (brighter = more confident)
-                if pixel_count > 0:
-                    intensity = np.mean(hsv[mask > 0, 2])  # V channel
-                    total_intensity += intensity * pixel_count
-            
-            color_pixels[color_name] = total_pixels
-            if total_pixels > 0:
-                color_scores[color_name] = total_intensity / total_pixels
+        try:
+            # Preprocessing for color detection
+            # Apply bilateral filter to reduce noise while preserving edges
+            if len(tl_roi.shape) == 3:
+                filtered = cv2.bilateralFilter(tl_roi, 9, 75, 75)
             else:
-                color_scores[color_name] = 0
-        
-        # Find dominant color considering both pixel count and intensity
-        best_color = None
-        best_score = 0
-        
-        for color_name in color_scores:
-            # Combined score: pixel count weighted by intensity
-            combined_score = color_pixels[color_name] * (color_scores[color_name] / 255.0)
-            if combined_score > best_score and color_pixels[color_name] > 20:  # Minimum pixels
-                best_score = combined_score
-                best_color = color_name
-        
-        if best_color is None:
+                filtered = tl_roi
+            
+            # Convert to HSV with error handling
+            try:
+                if len(filtered.shape) == 3 and filtered.shape[2] == 3:
+                    hsv = cv2.cvtColor(filtered, cv2.COLOR_RGB2HSV)
+                else:
+                    return TrafficLightState.UNKNOWN, 0.0
+            except cv2.error:
+                return TrafficLightState.UNKNOWN, 0.0
+            
+            # Color detection with multiple metrics
+            color_scores = {}
+            color_pixels = {}
+            color_intensities = {}
+            
+            for color_name, ranges in self.color_ranges.items():
+                total_pixels = 0
+                total_intensity = 0
+                max_intensity = 0
+                
+                for lower, upper in ranges:
+                    try:
+                        mask = cv2.inRange(hsv, lower, upper)
+                        pixel_count = np.sum(mask > 0)
+                        total_pixels += pixel_count
+                        
+                        # Intensity calculation
+                        if pixel_count > 0:
+                            intensities = hsv[mask > 0, 2]  # V channel (brightness)
+                            intensity_mean = np.mean(intensities)
+                            intensity_max = np.max(intensities)
+                            
+                            total_intensity += intensity_mean * pixel_count
+                            max_intensity = max(max_intensity, intensity_max)
+                            
+                    except Exception as e:
+                        self.logger.debug(f"Color range processing failed for {color_name}: {e}")
+                        continue
+                
+                color_pixels[color_name] = total_pixels
+                color_intensities[color_name] = max_intensity
+                
+                if total_pixels > 0:
+                    color_scores[color_name] = total_intensity / total_pixels
+                else:
+                    color_scores[color_name] = 0
+            
+            # Color selection with multiple criteria
+            best_color = None
+            best_combined_score = 0
+            
+            min_pixels_threshold = max(20, tl_roi.size * 0.05)  # Adaptive threshold
+            
+            for color_name in color_scores:
+                if color_pixels[color_name] < min_pixels_threshold:
+                    continue
+                
+                # Combined scoring
+                pixel_ratio = color_pixels[color_name] / max(tl_roi.size, 1)
+                intensity_score = color_scores[color_name] / 255.0
+                brightness_boost = color_intensities[color_name] / 255.0
+                
+                combined_score = (pixel_ratio * 0.4 + 
+                                intensity_score * 0.4 + 
+                                brightness_boost * 0.2)
+                
+                if combined_score > best_combined_score:
+                    best_combined_score = combined_score
+                    best_color = color_name
+            
+            if best_color is None:
+                return TrafficLightState.UNKNOWN, 0.0
+            
+            # Confidence calculation
+            total_colored_pixels = sum(color_pixels.values())
+            if total_colored_pixels == 0:
+                return TrafficLightState.UNKNOWN, 0.0
+            
+            pixel_confidence = color_pixels[best_color] / max(total_colored_pixels, 1)
+            intensity_confidence = color_scores[best_color] / 255.0
+            
+            # Combined confidence with clamping
+            confidence = clamp((pixel_confidence + intensity_confidence) / 2.0 * 1.3, 0.0, 1.0)
+            
+            # State mapping
+            state_mapping = {
+                'red': TrafficLightState.RED,
+                'yellow': TrafficLightState.YELLOW,
+                'green': TrafficLightState.GREEN
+            }
+            
+            final_state = state_mapping.get(best_color, TrafficLightState.UNKNOWN)
+            
+            return final_state, confidence
+            
+        except Exception as e:
+            self.logger.error(f"Traffic light color classification failed: {e}")
             return TrafficLightState.UNKNOWN, 0.0
-        
-        # Calculate confidence
-        total_colored_pixels = sum(color_pixels.values())
-        if total_colored_pixels == 0:
-            return TrafficLightState.UNKNOWN, 0.0
-        
-        confidence = color_pixels[best_color] / max(total_colored_pixels, 1)
-        confidence = min(confidence * 1.5, 1.0)  # Boost confidence slightly
-        
-        # Map to enum
-        state_mapping = {
-            'red': TrafficLightState.RED,
-            'yellow': TrafficLightState.YELLOW,
-            'green': TrafficLightState.GREEN
-        }
-        
-        return state_mapping.get(best_color, TrafficLightState.UNKNOWN), confidence
     
     def _is_traffic_light_relevant(self, x: int, y: int, w: int, h: int, distance: float) -> bool:
-        """Determine if traffic light is relevant for ego vehicle"""
-        # Check if traffic light is in front and reasonably centered
-        center_x = x + w / 2
-        
-        # Must be in central portion of image (not too far left/right)
-        if center_x < self.image_width * 0.2 or center_x > self.image_width * 0.8:
+        """Traffic light relevance determination"""
+        try:
+            # Center calculation with safe conversions
+            center_x = safe_float(x + w / 2)
+            center_y = safe_float(y + h / 2)
+            
+            # Must be in central portion of image (not too far left/right)
+            lateral_threshold = 0.25  # 25% from edges
+            if (center_x < self.image_width * lateral_threshold or 
+                center_x > self.image_width * (1 - lateral_threshold)):
+                return False
+            
+            # Distance validation
+            if not (5.0 <= distance <= 100.0):
+                return False
+            
+            # Must be in upper portion of image (traffic lights are mounted high)
+            if center_y > self.image_height * 0.7:
+                return False
+            
+            # Additional size-based validation
+            min_size = 10  # Minimum pixel size
+            max_size = min(self.image_width, self.image_height) * 0.3  # Max 30% of image
+            
+            if w < min_size or h < min_size or w > max_size or h > max_size:
+                return False
+            
+            return True
+            
+        except Exception as e:
+            self.logger.debug(f"Traffic light relevance check failed: {e}")
             return False
-        
-        # Must be at reasonable distance
-        if distance < 5.0 or distance > 100.0:
-            return False
-        
-        # Must be in upper portion of image (traffic lights are mounted high)
-        if y > self.image_height * 0.7:
-            return False
-        
-        return True
     
     def _get_most_relevant_traffic_light(self, traffic_lights: List[TrafficLightInfo]) -> Optional[TrafficLightInfo]:
-        """Select the most relevant traffic light for ego vehicle"""
-        relevant_lights = [tl for tl in traffic_lights if tl.relevant_for_ego]
-        
-        if not relevant_lights:
+        """Traffic light selection with prioritization"""
+        try:
+            relevant_lights = [tl for tl in traffic_lights if tl.relevant_for_ego]
+            
+            if not relevant_lights:
+                return None
+            
+            # Sorting with multiple criteria
+            def relevance_score(tl: TrafficLightInfo) -> Tuple[float, float, float]:
+                # Primary: distance (closer is better)
+                distance_score = 1.0 / max(tl.distance, 0.1)
+                # Secondary: confidence (higher is better)  
+                confidence_score = tl.confidence
+                # Tertiary: state priority (red > yellow > green > unknown)
+                state_priority = {
+                    TrafficLightState.RED: 3.0,
+                    TrafficLightState.YELLOW: 2.0,
+                    TrafficLightState.GREEN: 1.0,
+                    TrafficLightState.UNKNOWN: 0.0
+                }.get(tl.state, 0.0)
+                
+                return (state_priority, confidence_score, distance_score)
+            
+            # Sort by relevance score (descending)
+            relevant_lights.sort(key=relevance_score, reverse=True)
+            return relevant_lights[0]
+            
+        except Exception as e:
+            self.logger.error(f"Traffic light selection failed: {e}")
             return None
-        
-        # Sort by distance and confidence
-        relevant_lights.sort(key=lambda tl: (tl.distance, -tl.confidence))
-        return relevant_lights[0]
     
     def _calculate_object_confidence(self, mask: np.ndarray, depth_image: Optional[np.ndarray], 
-                                            object_type: ObjectType, bbox: Tuple[int, int, int, int]) -> float:
-        """Confidence calculation with multiple factors"""
-        base_confidence = 0.7
-        
-        # Size-based adjustment
-        area = np.sum(mask)
-        x1, y1, x2, y2 = bbox
-        
-        if object_type == ObjectType.VEHICLE:
-            # Vehicles should be reasonably sized
-            if 500 <= area <= 50000:
-                base_confidence += 0.1
-            elif area < 300:
-                base_confidence -= 0.3
-        elif object_type == ObjectType.PEDESTRIAN:
-            # Pedestrians are typically smaller
-            if 200 <= area <= 5000:
-                base_confidence += 0.1
-            elif area < 150:
-                base_confidence -= 0.3
-        
-        # Aspect ratio check
-        width, height = x2 - x1, y2 - y1
-        aspect_ratio = width / max(height, 1)
-        
-        if object_type == ObjectType.VEHICLE:
-            if 0.8 <= aspect_ratio <= 3.0:  # Reasonable vehicle aspect ratio
-                base_confidence += 0.1
-            else:
-                base_confidence -= 0.2
-        elif object_type == ObjectType.PEDESTRIAN:
-            if 0.3 <= aspect_ratio <= 1.2:  # Reasonable pedestrian aspect ratio
-                base_confidence += 0.1
-            else:
-                base_confidence -= 0.2
-        
-        # Depth consistency check
-        if depth_image is not None:
-            depths = depth_image[mask]
-            valid_depths = depths[(depths > 1.0) & (depths < 200.0)]
-            if len(valid_depths) > 10:
-                depth_std = np.std(valid_depths)
-                if depth_std < 3.0:  # Consistent depth
+                                    object_type: ObjectType, bbox: Tuple[int, int, int, int]) -> float:
+        """Confidence calculation with multiple validation factors"""
+        try:
+            base_confidence = 0.7
+            
+            # Size-based adjustment
+            area = np.sum(mask)
+            x1, y1, x2, y2 = bbox
+            
+            # Object-specific size validation
+            if object_type == ObjectType.VEHICLE:
+                if 500 <= area <= 50000:
                     base_confidence += 0.15
-                elif depth_std > 10.0:  # Inconsistent depth
-                    base_confidence -= 0.15
-        
-        # Position-based adjustment (objects in center are more likely to be relevant)
-        center_x = (x1 + x2) / 2
-        distance_from_center = abs(center_x - self.image_width / 2) / (self.image_width / 2)
-        if distance_from_center < 0.3:
-            base_confidence += 0.05
-        
-        return max(0.0, min(1.0, base_confidence))
+                elif area < 300:
+                    base_confidence -= 0.3
+                elif area > 80000:  # Too large, likely noise
+                    base_confidence -= 0.4
+            elif object_type == ObjectType.PEDESTRIAN:
+                if 200 <= area <= 5000:
+                    base_confidence += 0.15
+                elif area < 150:
+                    base_confidence -= 0.3
+                elif area > 10000:  # Too large for pedestrian
+                    base_confidence -= 0.4
+            
+            # Aspect ratio validation
+            width, height = safe_float(x2 - x1), safe_float(y2 - y1)
+            if width > 0 and height > 0:
+                aspect_ratio = width / height
+                
+                if object_type == ObjectType.VEHICLE:
+                    # Vehicles: wider range for different orientations
+                    if 0.5 <= aspect_ratio <= 4.0:
+                        base_confidence += 0.1
+                    else:
+                        base_confidence -= 0.2
+                elif object_type == ObjectType.PEDESTRIAN:
+                    # Pedestrians: typically taller than wide
+                    if 0.3 <= aspect_ratio <= 1.5:
+                        base_confidence += 0.1
+                    else:
+                        base_confidence -= 0.2
+            
+            # Depth consistency check
+            if depth_image is not None:
+                try:
+                    depths = depth_image[mask]
+                    valid_depths = depths[(depths > 1.0) & (depths < 200.0) & np.isfinite(depths)]
+                    
+                    if len(valid_depths) > 10:
+                        depth_std = np.std(valid_depths)
+                        depth_mean = np.mean(valid_depths)
+                        
+                        # Consistent depth boosts confidence
+                        if depth_std < 2.0:
+                            base_confidence += 0.2
+                        elif depth_std < 5.0:
+                            base_confidence += 0.1
+                        else:
+                            base_confidence -= 0.1
+                        
+                        # Reasonable depth range
+                        if 3.0 <= depth_mean <= 100.0:
+                            base_confidence += 0.05
+                        
+                except Exception as e:
+                    self.logger.debug(f"Depth consistency check failed: {e}")
+            
+            # Position-based adjustment
+            center_x = (x1 + x2) / 2
+            distance_from_center = abs(center_x - self.image_width / 2) / (self.image_width / 2)
+            
+            # Objects in center are more likely to be relevant
+            if distance_from_center < 0.2:
+                base_confidence += 0.1
+            elif distance_from_center < 0.4:
+                base_confidence += 0.05
+            
+            # Vertical position consideration (objects on ground more likely valid)
+            center_y = (y1 + y2) / 2
+            if center_y > self.image_height * 0.3:  # Lower in image
+                base_confidence += 0.05
+            
+            # Clamp final confidence to valid range
+            return clamp(base_confidence, 0.0, 1.0)
+            
+        except Exception as e:
+            self.logger.error(f"Object confidence calculation failed: {e}")
+            return 0.5  # Default moderate confidence
     
     def _estimate_object_motion(self, bbox: Tuple[int, int, int, int], 
-                                       object_type: ObjectType) -> bool:
-        """Motion estimation using simple tracking"""
-        # This is a placeholder for more sophisticated tracking
-        # In a real implementation, you would track objects across frames
-        
-        # For now, assume vehicles are more likely to be moving
-        if object_type == ObjectType.VEHICLE:
-            return True  # Could be refined with actual tracking
-        elif object_type == ObjectType.PEDESTRIAN:
-            return np.random.random() > 0.7  # Pedestrians less likely to be moving
-        
-        return False
+                               object_type: ObjectType) -> bool:
+        """Motion estimation with simple tracking history"""
+        try:
+            # This is a placeholder for motion estimation
+            # In a real implementation, this would use proper object tracking
+            
+            current_center = ((bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2)
+            
+            # Check if we have history for similar objects
+            # This is a simplified approach - real implementation would use proper tracking
+            
+            if object_type == ObjectType.VEHICLE:
+                # Vehicles are more likely to be moving, especially if detected consistently
+                return True
+            elif object_type == ObjectType.PEDESTRIAN:
+                # Pedestrians movement depends on location and context
+                # Near sidewalks less likely to be moving into road
+                center_x = current_center[0]
+                
+                # If pedestrian is in center lanes, more likely moving (crossing)
+                if 0.3 * self.image_width <= center_x <= 0.7 * self.image_width:
+                    return True
+                else:
+                    return False  # Likely on sidewalk
+            
+            return False
+            
+        except Exception as e:
+            self.logger.debug(f"Motion estimation failed: {e}")
+            return False
     
     def _update_object_tracking(self, detected_objects: List[DetectedObject]) -> List[DetectedObject]:
-        """Simple object tracking to assign track IDs"""
-        # This is a simplified tracking implementation
-        # A full implementation would use Kalman filters or similar
-        
-        for obj in detected_objects:
-            # Find closest previous track
-            min_distance = float('inf')
-            best_track_id = None
-            
-            for track_id, prev_obj in self.object_history.items():
-                # Calculate distance between current and previous detection
+        """Object tracking with association and cleanup"""
+        try:
+            # Tracking with distance calculation
+            for obj in detected_objects:
+                min_distance = float('inf')
+                best_track_id = None
+                
+                # Current object center
                 curr_center = ((obj.bbox[0] + obj.bbox[2]) / 2, (obj.bbox[1] + obj.bbox[3]) / 2)
-                prev_center = ((prev_obj.bbox[0] + prev_obj.bbox[2]) / 2, (prev_obj.bbox[1] + prev_obj.bbox[3]) / 2)
                 
-                pixel_distance = np.sqrt((curr_center[0] - prev_center[0])**2 + 
-                                       (curr_center[1] - prev_center[1])**2)
+                # Find best matching previous track
+                for track_id, prev_obj in self.object_history.items():
+                    # Only match same object types
+                    if prev_obj.object_type != obj.object_type:
+                        continue
+                    
+                    # Previous object center
+                    prev_center = ((prev_obj.bbox[0] + prev_obj.bbox[2]) / 2, 
+                                  (prev_obj.bbox[1] + prev_obj.bbox[3]) / 2)
+                    
+                    # Distance calculation
+                    pixel_distance = calculate_distance(curr_center, prev_center)
+                    
+                    # Size consistency check
+                    curr_size = (obj.bbox[2] - obj.bbox[0]) * (obj.bbox[3] - obj.bbox[1])
+                    prev_size = (prev_obj.bbox[2] - prev_obj.bbox[0]) * (prev_obj.bbox[3] - prev_obj.bbox[1])
+                    size_ratio = min(curr_size, prev_size) / max(curr_size, prev_size, 1)
+                    
+                    # Combined tracking score
+                    if pixel_distance < 150 and size_ratio > 0.5:  # Reasonable thresholds
+                        tracking_score = pixel_distance / (size_ratio + 0.1)  # Lower is better
+                        
+                        if tracking_score < min_distance:
+                            min_distance = tracking_score
+                            best_track_id = track_id
                 
-                if pixel_distance < min_distance and pixel_distance < 100:  # 100 pixel threshold
-                    min_distance = pixel_distance
-                    best_track_id = track_id
+                # Assign track ID
+                if best_track_id is not None:
+                    obj.track_id = best_track_id
+                    
+                    # Relative speed estimation
+                    prev_obj = self.object_history[best_track_id]
+                    if hasattr(prev_obj, 'distance') and hasattr(prev_obj, 'relative_speed'):
+                        # Simple speed estimation based on distance change
+                        distance_change = prev_obj.distance - obj.distance
+                        # Smooth with previous estimate (simple low-pass filter)
+                        obj.relative_speed = prev_obj.relative_speed * 0.7 + distance_change * 0.3
+                        obj.relative_speed = clamp(obj.relative_speed, -50.0, 50.0)  # Reasonable speed bounds
+                else:
+                    # New object
+                    obj.track_id = self.next_track_id
+                    self.next_track_id += 1
+                    obj.relative_speed = 0.0  # Unknown initial speed
+                
+                # Update history with current object
+                self.object_history[obj.track_id] = obj
             
-            if best_track_id is not None:
-                obj.track_id = best_track_id
-                # Update relative speed estimate
-                prev_obj = self.object_history[best_track_id]
-                obj.relative_speed = prev_obj.relative_speed * 0.8 + \
-                                   (prev_obj.distance - obj.distance) * 0.2  # Simple smoothing
-            else:
-                # New object
-                obj.track_id = self.next_track_id
-                self.next_track_id += 1
+            # History cleanup
+            if len(self.object_history) > 100:  # Prevent memory buildup
+                # Keep only recent tracks and current detections
+                current_tracks = {obj.track_id for obj in detected_objects}
+                # Also keep some recent tracks for continuity
+                all_track_ids = list(self.object_history.keys())
+                recent_tracks = set(all_track_ids[-50:])  # Keep last 50 tracks
+                
+                tracks_to_keep = current_tracks.union(recent_tracks)
+                self.object_history = {
+                    tid: obj for tid, obj in self.object_history.items() 
+                    if tid in tracks_to_keep
+                }
             
-            # Update history
-            self.object_history[obj.track_id] = obj
-        
-        # Clean old tracks (simple timeout)
-        if len(self.object_history) > 50:
-            # Keep only recent tracks
-            current_tracks = {obj.track_id for obj in detected_objects}
-            self.object_history = {tid: obj for tid, obj in self.object_history.items() 
-                                 if tid in current_tracks}
-        
-        return detected_objects
+            return detected_objects
+            
+        except Exception as e:
+            self.logger.error(f"Object tracking update failed: {e}")
+            return detected_objects
     
     def _calculate_curvature(self, left_boundary: Optional[np.ndarray], 
-                                    right_boundary: Optional[np.ndarray]) -> float:
-        """Curvature calculation"""
-        curvatures = []
-        
-        if left_boundary is not None and len(left_boundary) >= 3:
-            # For polynomial ax^2 + bx + c, curvature = |2a| / (1 + (2ax + b)^2)^1.5
-            # Approximate at y = image_height - 100
-            y = self.image_height - 100
-            a, b = left_boundary[0], left_boundary[1]
-            denominator = (1 + (2*a*y + b)**2)**1.5
-            if denominator > 0:
-                curvatures.append(abs(2*a) / denominator)
-        
-        if right_boundary is not None and len(right_boundary) >= 3:
-            y = self.image_height - 100
-            a, b = right_boundary[0], right_boundary[1]
-            denominator = (1 + (2*a*y + b)**2)**1.5
-            if denominator > 0:
-                curvatures.append(abs(2*a) / denominator)
-        
-        return np.mean(curvatures) if curvatures else 0.0
+                            right_boundary: Optional[np.ndarray]) -> float:
+        """Curvature calculation with error handling"""
+        try:
+            curvatures = []
+            
+            # Curvature calculation for polynomial curves
+            evaluation_points = [
+                self.image_height - 50,   # Near field
+                self.image_height - 100,  # Medium field
+                self.image_height - 150   # Far field (if available)
+            ]
+            
+            for boundary, boundary_name in [(left_boundary, "left"), (right_boundary, "right")]:
+                if boundary is not None and len(boundary) >= 3:
+                    for y in evaluation_points:
+                        if y < 0:
+                            continue
+                            
+                        try:
+                            # For polynomial ax^2 + bx + c, curvature = |2a| / (1 + (2ax + b)^2)^1.5
+                            a, b = safe_float(boundary[0]), safe_float(boundary[1])
+                            
+                            # Calculate derivative at point
+                            derivative = 2 * a * y + b
+                            denominator = (1 + derivative**2)**1.5
+                            
+                            if denominator > 1e-6:  # Avoid division by very small numbers
+                                curvature = abs(2 * a) / denominator
+                                # Clamp curvature to reasonable bounds
+                                curvature = clamp(curvature, 0.0, 0.1)  # Max curvature limit
+                                curvatures.append(curvature)
+                                
+                        except Exception as e:
+                            self.logger.debug(f"Curvature calculation failed for {boundary_name} at y={y}: {e}")
+                            continue
+            
+            if curvatures:
+                # Use median for robustness
+                return safe_float(np.median(curvatures))
+            else:
+                return 0.0
+                
+        except Exception as e:
+            self.logger.error(f"Curvature calculation failed: {e}")
+            return 0.0
     
     def _calculate_center_line(self, left_boundary: Optional[np.ndarray], 
-                                      right_boundary: Optional[np.ndarray],
-                                      lane_width: float) -> Optional[np.ndarray]:
+                              right_boundary: Optional[np.ndarray],
+                              lane_width: float) -> Optional[np.ndarray]:
         """Center line calculation with single boundary handling"""
-        if left_boundary is not None and right_boundary is not None:
-            # Both boundaries available
-            return (left_boundary + right_boundary) / 2
-        elif left_boundary is not None:
-            # Only left boundary - estimate right boundary
-            # Assume standard lane width in pixels
-            lane_width_pixels = lane_width * 30  # Rough conversion
-            # Shift left boundary to the right
-            estimated_center = left_boundary.copy()
-            estimated_center[-1] += lane_width_pixels / 2  # Adjust constant term
-            return estimated_center
-        elif right_boundary is not None:
-            # Only right boundary - estimate left boundary
-            lane_width_pixels = lane_width * 30
-            estimated_center = right_boundary.copy()
-            estimated_center[-1] -= lane_width_pixels / 2
-            return estimated_center
-        
-        return None
+        try:
+            if left_boundary is not None and right_boundary is not None:
+                # Both boundaries available - simple average
+                return (left_boundary + right_boundary) / 2
+                
+            elif left_boundary is not None:
+                # Only left boundary - estimate center using lane width
+                lane_width_pixels = safe_float(lane_width * 30)  # Rough pixel conversion
+                estimated_center = left_boundary.copy()
+                # Shift right by half lane width (adjust constant term)
+                estimated_center[-1] += lane_width_pixels / 2
+                return estimated_center
+                
+            elif right_boundary is not None:
+                # Only right boundary - estimate center using lane width  
+                lane_width_pixels = safe_float(lane_width * 30)
+                estimated_center = right_boundary.copy()
+                # Shift left by half lane width
+                estimated_center[-1] -= lane_width_pixels / 2
+                return estimated_center
+            
+            return None
+            
+        except Exception as e:
+            self.logger.error(f"Center line calculation failed: {e}")
+            return None
     
     def _calculate_heading_angle(self, center_line: Optional[np.ndarray]) -> float:
-        """Heading angle calculation"""
+        """Heading angle calculation with multiple point averaging"""
         if center_line is None or len(center_line) < 2:
             return 0.0
         
-        # Calculate angle at multiple points and average
-        y_positions = [self.image_height - 50, self.image_height - 100, self.image_height - 150]
-        angles = []
-        
-        for y in y_positions:
-            if y < 0:
-                continue
-            try:
-                # For polynomial ax^2 + bx + c, derivative is 2ax + b
-                slope = 2 * center_line[0] * y + center_line[1]
-                angle = np.arctan(slope)
-                angles.append(angle)
-            except:
-                continue
-        
-        return np.mean(angles) if angles else 0.0
+        try:
+            # Calculate angle at multiple points and average for stability
+            y_positions = [
+                self.image_height - 30,   # Very near
+                self.image_height - 60,   # Near  
+                self.image_height - 100,  # Medium
+                self.image_height - 140   # Far (if available)
+            ]
+            
+            angles = []
+            
+            for y in y_positions:
+                if y < 0:
+                    continue
+                    
+                try:
+                    # For polynomial ax^2 + bx + c, derivative is 2ax + b
+                    a, b = safe_float(center_line[0]), safe_float(center_line[1])
+                    slope = 2 * a * y + b
+                    
+                    # Convert slope to angle (radians)
+                    angle = np.arctan(slope)
+                    
+                    # Clamp angle to reasonable bounds  
+                    angle = clamp(angle, -np.pi/4, np.pi/4)  # ±45 degrees max
+                    angles.append(angle)
+                    
+                except Exception as e:
+                    self.logger.debug(f"Heading angle calculation failed at y={y}: {e}")
+                    continue
+            
+            if angles:
+                # Weighted average (closer points have more weight)
+                weights = np.array([1.0, 0.8, 0.6, 0.4][:len(angles)])
+                weighted_angle = np.average(angles, weights=weights)
+                return safe_float(weighted_angle)
+            else:
+                return 0.0
+                
+        except Exception as e:
+            self.logger.error(f"Heading angle calculation failed: {e}")
+            return 0.0
     
     def _classify_lane_types(self, rgb_image: np.ndarray, 
-                                    left_boundary: Optional[np.ndarray],
-                                    right_boundary: Optional[np.ndarray],
-                                    left_pixels: Optional[np.ndarray],
-                                    right_pixels: Optional[np.ndarray]) -> Tuple[LaneType, LaneType]:
-        """Lane type classification using RGB analysis"""
-        left_type = LaneType.UNKNOWN
-        right_type = LaneType.UNKNOWN
-        
-        # Analyze left boundary
-        if left_pixels is not None and len(left_pixels) > 10:
-            left_type = self._analyze_lane_marking_type(rgb_image, left_pixels)
-        
-        # Analyze right boundary  
-        if right_pixels is not None and len(right_pixels) > 10:
-            right_type = self._analyze_lane_marking_type(rgb_image, right_pixels)
-        
-        return left_type, right_type
+                            left_boundary: Optional[np.ndarray],
+                            right_boundary: Optional[np.ndarray],
+                            left_pixels: Optional[np.ndarray],
+                            right_pixels: Optional[np.ndarray]) -> Tuple[LaneType, LaneType]:
+        """Lane type classification with color analysis"""
+        try:
+            left_type = LaneType.UNKNOWN
+            right_type = LaneType.UNKNOWN
+            
+            # Analyze left boundary
+            if left_pixels is not None and len(left_pixels) > 10:
+                left_type = self._analyze_lane_marking_type(rgb_image, left_pixels)
+            
+            # Analyze right boundary
+            if right_pixels is not None and len(right_pixels) > 10:
+                right_type = self._analyze_lane_marking_type(rgb_image, right_pixels)
+            
+            return left_type, right_type
+            
+        except Exception as e:
+            self.logger.error(f"Lane type classification failed: {e}")
+            return LaneType.UNKNOWN, LaneType.UNKNOWN
     
     def _analyze_lane_marking_type(self, rgb_image: np.ndarray, pixels: np.ndarray) -> LaneType:
-        """Analyze lane marking type from RGB pixels"""
+        """Lane marking analysis with color classification"""
         if len(pixels) < 10:
             return LaneType.UNKNOWN
         
-        # Sample colors at lane marking pixels
-        colors = []
-        for pixel in pixels[:100]:  # Sample up to 100 pixels
-            x, y = int(pixel[0]), int(pixel[1])
-            if 0 <= x < rgb_image.shape[1] and 0 <= y < rgb_image.shape[0]:
-                colors.append(rgb_image[y, x])
-        
-        if not colors:
+        try:
+            # Sample colors at lane marking pixels with bounds checking
+            colors = []
+            sample_size = min(100, len(pixels))  # Sample up to 100 pixels
+            
+            # Use stratified sampling
+            indices = np.linspace(0, len(pixels)-1, sample_size, dtype=int)
+            
+            for idx in indices:
+                pixel = pixels[idx]
+                x, y = int(pixel[0]), int(pixel[1])
+                
+                # Bounds checking
+                if (0 <= x < rgb_image.shape[1] and 
+                    0 <= y < rgb_image.shape[0]):
+                    colors.append(rgb_image[y, x])
+            
+            if not colors:
+                return LaneType.UNKNOWN
+            
+            colors = np.array(colors)
+            
+            # Color analysis
+            # Convert to HSV for color classification
+            try:
+                # Reshape for cv2 conversion
+                colors_reshaped = colors.reshape(-1, 1, 3).astype(np.uint8)
+                hsv_colors = cv2.cvtColor(colors_reshaped, cv2.COLOR_RGB2HSV)
+                hsv_colors = hsv_colors.reshape(-1, 3)
+                
+                # Analyze color distribution
+                avg_hsv = np.mean(hsv_colors, axis=0)
+                hue_std = np.std(hsv_colors[:, 0])
+                
+                # Color classification logic
+                avg_hue = safe_float(avg_hsv[0])
+                avg_sat = safe_float(avg_hsv[1])
+                avg_val = safe_float(avg_hsv[2])
+                
+                # Yellow detection
+                if (15 <= avg_hue <= 35 and avg_sat > 80 and avg_val > 100):
+                    # Check for dashed pattern (simplified - would need temporal analysis)
+                    # For now, assume most yellow lines are solid center lines
+                    return LaneType.SOLID_YELLOW
+                
+                # White detection
+                elif (avg_sat < 50 and avg_val > 150):  # Low saturation, high brightness
+                    # Simple dashed vs solid classification based on pixel density
+                    # This is a rough approximation - real implementation would analyze gaps
+                    pixel_density = len(colors) / max(len(pixels), 1)
+                    
+                    if pixel_density > 0.7:  # Dense pixels = likely solid
+                        return LaneType.SOLID_WHITE
+                    else:  # Sparse pixels = likely dashed
+                        return LaneType.DASHED_WHITE
+                
+                # Default to dashed white for unclassified but visible markings
+                else:
+                    return LaneType.DASHED_WHITE
+                    
+            except Exception as e:
+                self.logger.debug(f"HSV conversion failed in lane marking analysis: {e}")
+                
+                # Fallback to RGB analysis
+                avg_color = np.mean(colors, axis=0)
+                
+                # Simple RGB-based classification
+                r, g, b = avg_color
+                
+                # Yellow-ish (high red and green, low blue)
+                if r > 150 and g > 150 and b < 100:
+                    return LaneType.SOLID_YELLOW
+                # White-ish (high all channels)
+                elif r > 180 and g > 180 and b > 180:
+                    return LaneType.SOLID_WHITE
+                # Light colors default to dashed white
+                elif (r + g + b) / 3 > 120:
+                    return LaneType.DASHED_WHITE
+                else:
+                    return LaneType.UNKNOWN
+                    
+        except Exception as e:
+            self.logger.error(f"Lane marking type analysis failed: {e}")
             return LaneType.UNKNOWN
-        
-        colors = np.array(colors)
-        avg_color = np.mean(colors, axis=0)
-        
-        # Simple color-based classification
-        # Convert to HSV for better color analysis
-        hsv_color = cv2.cvtColor(avg_color.reshape(1, 1, 3).astype(np.uint8), cv2.COLOR_RGB2HSV)[0, 0]
-        
-        # Check if it's yellow-ish
-        if 15 <= hsv_color[0] <= 35 and hsv_color[1] > 100:  # Yellow hue range
-            return LaneType.DASHED_YELLOW  # Assume dashed for simplicity
-        else:
-            # Default to white (most common)
-            return LaneType.DASHED_WHITE
     
     def _calculate_lane_confidence(self, roadline_roi: np.ndarray, 
-                                          left_boundary: Optional[np.ndarray],
-                                          right_boundary: Optional[np.ndarray],
-                                          left_pixels: Optional[np.ndarray],
-                                          right_pixels: Optional[np.ndarray]) -> float:
-        """Lane confidence calculation"""
-        base_confidence = 0.3
-        
-        # Boundary detection quality
-        if left_boundary is not None:
-            base_confidence += 0.25
-            if left_pixels is not None and len(left_pixels) > 50:
+                                  left_boundary: Optional[np.ndarray],
+                                  right_boundary: Optional[np.ndarray],
+                                  left_pixels: Optional[np.ndarray],
+                                  right_pixels: Optional[np.ndarray]) -> float:
+        """Lane confidence calculation with multiple factors"""
+        try:
+            base_confidence = 0.2
+            
+            # Boundary detection quality
+            boundaries_detected = 0
+            if left_boundary is not None:
+                base_confidence += 0.3
+                boundaries_detected += 1
+                if left_pixels is not None and len(left_pixels) > 50:
+                    base_confidence += 0.1
+                if left_pixels is not None and len(left_pixels) > 100:
+                    base_confidence += 0.05
+            
+            if right_boundary is not None:
+                base_confidence += 0.3
+                boundaries_detected += 1
+                if right_pixels is not None and len(right_pixels) > 50:
+                    base_confidence += 0.1
+                if right_pixels is not None and len(right_pixels) > 100:
+                    base_confidence += 0.05
+            
+            # Both boundaries detected bonus
+            if boundaries_detected == 2:
+                base_confidence += 0.15
+            
+            # Total lane pixel count assessment
+            total_pixels = np.sum(roadline_roi)
+            if total_pixels > 200:
                 base_confidence += 0.1
-        
-        if right_boundary is not None:
-            base_confidence += 0.25
-            if right_pixels is not None and len(right_pixels) > 50:
+            if total_pixels > 500:
                 base_confidence += 0.1
-        
-        # Total lane pixel count
-        total_pixels = np.sum(roadline_roi)
-        if total_pixels > 200:
-            base_confidence += 0.1
-        elif total_pixels > 400:
-            base_confidence += 0.2
-        
-        # Polynomial fit quality (if we had fit errors, we could use those)
-        # For now, assume good fits contribute to confidence
-        
-        return min(1.0, base_confidence)
+            if total_pixels > 1000:
+                base_confidence += 0.05
+            
+            # Pixel distribution quality (more spread out is better)
+            if total_pixels > 0:
+                rows, cols = np.where(roadline_roi) 
+                if len(rows) > 0:
+                    row_spread = np.max(rows) - np.min(rows)
+                    col_spread = np.max(cols) - np.min(cols)
+                    
+                    # Good vertical spread indicates lane extends into distance
+                    if row_spread > self.image_height * 0.3:
+                        base_confidence += 0.05
+                    if row_spread > self.image_height * 0.5:
+                        base_confidence += 0.05
+                    
+                    # Reasonable horizontal spread
+                    if self.image_width * 0.2 < col_spread < self.image_width * 0.8:
+                        base_confidence += 0.05
+            
+            # Clamp to valid confidence range
+            return clamp(base_confidence, 0.0, 1.0)
+            
+        except Exception as e:
+            self.logger.error(f"Lane confidence calculation failed: {e}")
+            return 0.3  # Default moderate confidence
     
     def _calculate_traffic_light_distance(self, x: int, y: int, w: int, h: int,
-                                                 depth_image: Optional[np.ndarray]) -> float:
-        """Traffic light distance calculation"""
-        if depth_image is not None:
-            # Sample multiple points in the traffic light region
-            center_x, center_y = x + w // 2, y + h // 2
-            sample_points = [
-                (center_x, center_y),
-                (x + w//4, y + h//4),
-                (x + 3*w//4, y + h//4),
-                (x + w//4, y + 3*h//4),
-                (x + 3*w//4, y + 3*h//4)
-            ]
+                                         depth_image: Optional[np.ndarray]) -> float:
+        """Traffic light distance calculation with multiple fallbacks"""
+        try:
+            if depth_image is not None:
+                # Sampling strategy for accuracy
+                center_x, center_y = x + w // 2, y + h // 2
+                
+                # Sample multiple points with different strategies
+                sample_points = []
+                
+                # Center point
+                sample_points.append((center_x, center_y))
+                
+                # Edge points (traffic lights often have bright edges)
+                margin = max(2, min(w, h) // 4)
+                sample_points.extend([
+                    (x + margin, y + margin),
+                    (x + w - margin, y + margin), 
+                    (x + margin, y + h - margin),
+                    (x + w - margin, y + h - margin)
+                ])
+                
+                # Additional center-region points
+                for dx in [-w//4, 0, w//4]:
+                    for dy in [-h//4, 0, h//4]:
+                        px, py = center_x + dx, center_y + dy
+                        if x <= px < x + w and y <= py < y + h:
+                            sample_points.append((px, py))
+                
+                valid_distances = []
+                
+                for px, py in sample_points:
+                    # Bounds checking
+                    if (0 <= px < depth_image.shape[1] and 
+                        0 <= py < depth_image.shape[0]):
+                        distance = safe_float(depth_image[py, px])
+                        
+                        # Validation for traffic light distances
+                        if 5.0 <= distance <= 200.0:  # Reasonable range for traffic lights
+                            valid_distances.append(distance)
+                
+                if valid_distances:
+                    # Use median for robustness against outliers
+                    median_distance = np.median(valid_distances)
+                    
+                    # Additional validation - traffic lights shouldn't be too close/far
+                    if 8.0 <= median_distance <= 150.0:
+                        return safe_float(median_distance)
             
-            valid_distances = []
-            for px, py in sample_points:
-                if 0 <= px < depth_image.shape[1] and 0 <= py < depth_image.shape[0]:
-                    distance = depth_image[py, px]
-                    if 5.0 <= distance <= 150.0:  # Reasonable range for traffic lights
-                        valid_distances.append(distance)
+            # Fallback estimation using size and position
+            # Traffic lights have known approximate sizes
+            apparent_size = max(safe_float(w), safe_float(h))
             
-            if valid_distances:
-                return float(np.median(valid_distances))
-        
-        # Fallback: estimate from size
-        # Typical traffic light is ~0.3m diameter
-        apparent_size = max(w, h)
-        estimated_distance = (0.3 * self.focal_length) / max(apparent_size, 1)
-        return max(10.0, min(estimated_distance, 100.0))
+            # Size-based estimation
+            # Typical traffic light diameter: 20-30cm, assume 25cm
+            typical_light_diameter = 0.25  # meters
+            
+            if apparent_size > 1:
+                estimated_distance = (typical_light_diameter * self.focal_length) / apparent_size
+                
+                # Position-based adjustment (higher = farther typically)
+                y_center = safe_float(y + h / 2)
+                height_factor = 1.0 + (self.image_height - y_center) / self.image_height * 0.3
+                estimated_distance *= height_factor
+                
+                # Clamp to reasonable bounds for traffic lights
+                return clamp(estimated_distance, 10.0, 120.0)
+            
+            # Final fallback
+            return 40.0  # Default reasonable distance
+            
+        except Exception as e:
+            self.logger.error(f"Traffic light distance calculation failed: {e}")
+            return 40.0
     
     def _is_road_clear(self, semantic_image: np.ndarray, depth_image: Optional[np.ndarray],
-                              obstacles: List[DetectedObject], min_distance: float = 20.0) -> bool:
-        """Road clearance check using detected objects"""
-        # Check detected obstacles first
-        for obstacle in obstacles:
-            if (obstacle.lane_assignment == 0 and  # Same lane
-                obstacle.distance < min_distance and
-                obstacle.confidence > 0.5):
-                return False
-        
-        # Fallback to semantic + depth analysis
-        if depth_image is None:
-            return True
-        
-        # Check center region ahead
-        h, w = semantic_image.shape
-        roi_y1, roi_y2 = h//2, h*3//4
-        roi_x1, roi_x2 = w//3, w*2//3
-        
-        roi_semantic = semantic_image[roi_y1:roi_y2, roi_x1:roi_x2]
-        roi_depth = depth_image[roi_y1:roi_y2, roi_x1:roi_x2]
-        
-        # Find non-road pixels at close distance
-        road_mask = (roi_semantic == self.CLASS_TO_ID.get('road', 7))
-        close_objects = (roi_depth < min_distance) & (roi_depth > 1.0) & ~road_mask
-        
-        # If more than 5% of ROI has close non-road objects, consider blocked
-        blocked_ratio = np.sum(close_objects) / close_objects.size
-        return blocked_ratio < 0.05
+                      obstacles: List[DetectedObject], min_distance: float = 20.0) -> bool:
+        """Road clearance check with obstacle analysis"""
+        try:
+            # Primary check: detected obstacles in same lane
+            same_lane_obstacles = [
+                obs for obs in obstacles 
+                if (obs.lane_assignment == 0 and  # Same lane
+                    obs.distance < min_distance and
+                    obs.confidence > 0.6)  # Higher confidence threshold
+            ]
+            
+            if same_lane_obstacles:
+                # Check if obstacles are actually blocking (not just detected noise)
+                blocking_obstacles = [
+                    obs for obs in same_lane_obstacles
+                    if (obs.object_type in [ObjectType.VEHICLE, ObjectType.PEDESTRIAN] and
+                        obs.distance < min_distance * 0.8)  # Closer threshold for blocking
+                ]
+                
+                if blocking_obstacles:
+                    return False
+            
+            # Secondary check: semantic + depth analysis for missed objects
+            if depth_image is None:
+                return len(same_lane_obstacles) == 0
+            
+            try:
+                # ROI for road ahead analysis
+                h, w = semantic_image.shape
+                
+                # More focused ROI - central driving area
+                roi_y1 = safe_int(h * 0.4)   # Start from 40% down
+                roi_y2 = safe_int(h * 0.8)   # End at 80% down  
+                roi_x1 = safe_int(w * 0.35)  # 35% from left
+                roi_x2 = safe_int(w * 0.65)  # 65% from left
+                
+                # Ensure valid ROI bounds
+                roi_y1 = clamp(roi_y1, 0, h)
+                roi_y2 = clamp(roi_y2, roi_y1, h)
+                roi_x1 = clamp(roi_x1, 0, w)
+                roi_x2 = clamp(roi_x2, roi_x1, w)
+                
+                if roi_y2 <= roi_y1 or roi_x2 <= roi_x1:
+                    return True  # Invalid ROI, assume clear
+                
+                roi_semantic = semantic_image[roi_y1:roi_y2, roi_x1:roi_x2]
+                roi_depth = depth_image[roi_y1:roi_y2, roi_x1:roi_x2]
+                
+                # Obstacle detection in ROI
+                road_class_id = self.CLASS_TO_ID.get('road', 7)
+                vehicle_class_id = self.CLASS_TO_ID.get('vehicles', 10)
+                pedestrian_class_id = self.CLASS_TO_ID.get('pedestrian', 4)
+                
+                # Create masks for different object types
+                road_mask = (roi_semantic == road_class_id)
+                vehicle_mask = (roi_semantic == vehicle_class_id)
+                pedestrian_mask = (roi_semantic == pedestrian_class_id)
+                
+                # Check for close vehicles/pedestrians
+                close_depth_mask = (roi_depth < min_distance) & (roi_depth > 2.0)
+                
+                # Vehicles in path
+                close_vehicles = vehicle_mask & close_depth_mask
+                if np.sum(close_vehicles) > 100:  # Significant vehicle presence
+                    return False
+                
+                # Pedestrians in path (lower threshold as they're smaller)
+                close_pedestrians = pedestrian_mask & close_depth_mask
+                if np.sum(close_pedestrians) > 50:  # Significant pedestrian presence
+                    return False
+                
+                # General obstacle check (non-road objects at close distance)
+                non_road_close = ~road_mask & close_depth_mask
+                obstacle_ratio = np.sum(non_road_close) / max(non_road_close.size, 1)
+                
+                # If more than 8% of ROI has close non-road objects, consider blocked
+                return obstacle_ratio < 0.08
+                
+            except Exception as e:
+                self.logger.debug(f"Semantic road clearance check failed: {e}")
+                return len(same_lane_obstacles) == 0
+            
+        except Exception as e:
+            self.logger.error(f"Road clearance check failed: {e}")
+            return True  # Default to clear if check fails
     
     def _detect_intersection(self, semantic_image: np.ndarray, 
-                                    traffic_lights: List[TrafficLightInfo]) -> bool:
-        """Intersection detection"""
-        # Check for traffic lights
-        if any(tl.relevant_for_ego and tl.distance < 50.0 for tl in traffic_lights):
-            return True
-        
-        # Check for traffic signs
-        has_traffic_sign = np.any(semantic_image == self.CLASS_TO_ID.get('traffic_sign', 12))
-        if has_traffic_sign:
-            return True
-        
-        # Check road topology (simplified)
-        # Look for significant changes in road area in the forward direction
-        road_mask = (semantic_image == self.CLASS_TO_ID.get('road', 7))
-        
-        # Compare road area in near vs far regions
-        h, w = semantic_image.shape
-        near_region = road_mask[h*2//3:, :]
-        far_region = road_mask[h//3:h*2//3, :]
-        
-        near_road_ratio = np.sum(near_region) / near_region.size
-        far_road_ratio = np.sum(far_region) / far_region.size
-        
-        # Significant increase in road area might indicate intersection
-        return far_road_ratio > near_road_ratio * 1.5
+                            traffic_lights: List[TrafficLightInfo]) -> bool:
+        """Intersection detection with multiple indicators"""
+        try:
+            # Primary indicator: relevant traffic lights nearby
+            nearby_relevant_lights = [
+                tl for tl in traffic_lights 
+                if tl.relevant_for_ego and tl.distance < 60.0
+            ]
+            
+            if nearby_relevant_lights:
+                return True
+            
+            # Secondary indicator: traffic signs
+            traffic_sign_class_id = self.CLASS_TO_ID.get('traffic_sign', 12)
+            traffic_sign_mask = (semantic_image == traffic_sign_class_id)
+            
+            if np.sum(traffic_sign_mask) > 200:  # Significant traffic sign presence
+                return True
+            
+            # Tertiary indicator: road topology analysis
+            road_class_id = self.CLASS_TO_ID.get('road', 7)
+            road_mask = (semantic_image == road_class_id)
+            
+            # Road topology analysis
+            h, w = semantic_image.shape
+            
+            # Analyze road area in horizontal strips
+            strip_height = h // 10
+            road_areas = []
+            
+            for i in range(3, 8):  # Middle portion of image
+                y_start = i * strip_height
+                y_end = (i + 1) * strip_height
+                
+                if y_end <= h:
+                    strip = road_mask[y_start:y_end, :]
+                    road_area = np.sum(strip)
+                    road_areas.append(road_area)
+            
+            if len(road_areas) >= 3:
+                # Look for significant changes in road area (intersection expansion)
+                area_changes = []
+                for i in range(1, len(road_areas)):
+                    change_ratio = road_areas[i] / max(road_areas[i-1], 1)
+                    area_changes.append(change_ratio)
+                
+                # Significant expansion might indicate intersection
+                max_expansion = max(area_changes) if area_changes else 1.0
+                if max_expansion > 1.4:  # 40% increase in road area
+                    return True
+            
+            # Additional check: lane marking complexity
+            roadline_class_id = self.CLASS_TO_ID.get('roadline', 6)
+            roadline_mask = (semantic_image == roadline_class_id)
+            
+            # Count connected components in lane markings
+            if np.sum(roadline_mask) > 0:
+                roadline_uint8 = roadline_mask.astype(np.uint8) * 255
+                contours, _ = cv2.findContours(
+                    roadline_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+                )
+                
+                # Many separate lane marking components might indicate intersection
+                if len(contours) > 8:  # Complex lane marking pattern
+                    return True
+            
+            return False
+            
+        except Exception as e:
+            self.logger.error(f"Intersection detection failed: {e}")
+            return False
     
     def _assess_sensor_quality(self, rgb_image: np.ndarray, semantic_image: np.ndarray, 
-                             depth_image: Optional[np.ndarray]) -> Dict[str, float]:
-        """Assess quality of sensor data for confidence estimation"""
+                              depth_image: Optional[np.ndarray]) -> Dict[str, float]:
+        """Sensor quality assessment with more comprehensive metrics"""
         quality = {}
         
-        # RGB image quality
-        if rgb_image is not None:
-            # Check for proper exposure and contrast
-            gray = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2GRAY)
-            contrast = np.std(gray)
-            brightness = np.mean(gray)
+        try:
+            # RGB image quality assessment
+            if rgb_image is not None:
+                gray = cv2.cvtColor(rgb_image, cv2.COLOR_RGB2GRAY)
+                
+                # Contrast assessment (using standard deviation)
+                contrast = safe_float(np.std(gray))
+                contrast_score = clamp(contrast / 50.0, 0.0, 1.0)
+                
+                # Brightness assessment (prefer values around 128)
+                brightness = safe_float(np.mean(gray))
+                brightness_score = 1.0 - abs(brightness - 128.0) / 128.0
+                brightness_score = clamp(brightness_score, 0.0, 1.0)
+                
+                # Sharpness assessment (using Laplacian variance)
+                laplacian_var = safe_float(cv2.Laplacian(gray, cv2.CV_64F).var())
+                sharpness_score = clamp(laplacian_var / 1000.0, 0.0, 1.0)
+                
+                # Combined RGB quality score
+                quality['rgb'] = (contrast_score * 0.4 + 
+                                brightness_score * 0.3 + 
+                                sharpness_score * 0.3)
+            else:
+                quality['rgb'] = 0.0
             
-            # Good contrast and reasonable brightness
-            quality['rgb'] = min(1.0, contrast / 50.0) * (1.0 - abs(brightness - 128) / 128.0)
-        else:
-            quality['rgb'] = 0.0
-        
-        # Semantic image quality
-        if semantic_image is not None:
-            # Check for variety of classes (good segmentation)
-            unique_classes = len(np.unique(semantic_image))
-            quality['semantic'] = min(1.0, unique_classes / 10.0)  # Expect ~10 classes
-        else:
-            quality['semantic'] = 0.0
-        
-        # Depth image quality
-        if depth_image is not None:
-            valid_depth_ratio = np.sum((depth_image > 1.0) & (depth_image < 200.0)) / depth_image.size
-            quality['depth'] = valid_depth_ratio
-        else:
-            quality['depth'] = 0.0
+            # Semantic image quality assessment
+            if semantic_image is not None:
+                unique_classes = len(np.unique(semantic_image))
+                class_diversity_score = clamp(unique_classes / 15.0, 0.0, 1.0)  # Expect ~15 classes
+                
+                # Check for reasonable class distribution
+                class_counts = np.bincount(semantic_image.flatten())
+                if len(class_counts) > 1:
+                    # Entropy-based diversity measure
+                    probabilities = class_counts / np.sum(class_counts)
+                    entropy = -np.sum(probabilities * np.log2(probabilities + 1e-10))
+                    entropy_score = clamp(entropy / 4.0, 0.0, 1.0)  # Normalize by max entropy
+                else:
+                    entropy_score = 0.0
+                
+                quality['semantic'] = (class_diversity_score * 0.6 + entropy_score * 0.4)
+            else:
+                quality['semantic'] = 0.0
+            
+            # Depth image quality assessment
+            if depth_image is not None:
+                # Valid depth ratio (finite, positive, reasonable range)
+                valid_mask = (
+                    np.isfinite(depth_image) & 
+                    (depth_image > 0.5) & 
+                    (depth_image < 300.0)
+                )
+                valid_ratio = np.sum(valid_mask) / depth_image.size
+                
+                # Depth range assessment (good depth should have reasonable spread)
+                if np.sum(valid_mask) > 100:
+                    valid_depths = depth_image[valid_mask]
+                    depth_range = np.max(valid_depths) - np.min(valid_depths)
+                    range_score = clamp(depth_range / 100.0, 0.0, 1.0)  # Normalize by 100m range
+                    
+                    # Depth smoothness (not too noisy)
+                    depth_gradient = np.gradient(depth_image)
+                    gradient_magnitude = np.sqrt(depth_gradient[0]**2 + depth_gradient[1]**2)
+                    smoothness_score = 1.0 - clamp(np.mean(gradient_magnitude) / 10.0, 0.0, 1.0)
+                else:
+                    range_score = 0.0
+                    smoothness_score = 0.0
+                
+                quality['depth'] = (valid_ratio * 0.5 + range_score * 0.3 + smoothness_score * 0.2)
+            else:
+                quality['depth'] = 0.0
+            
+            # Overall sensor quality
+            weights = {'rgb': 0.4, 'semantic': 0.4, 'depth': 0.2}
+            quality['overall'] = sum(quality[sensor] * weights[sensor] for sensor in weights)
+            
+        except Exception as e:
+            self.logger.error(f"Sensor quality assessment failed: {e}")
+            # Return default low quality scores
+            quality = {'rgb': 0.3, 'semantic': 0.3, 'depth': 0.3, 'overall': 0.3}
         
         return quality
     
     def _detect_speed_limit(self, rgb_image: np.ndarray, semantic_image: np.ndarray) -> Optional[float]:
-        """Detect speed limit signs (placeholder for OCR implementation)"""
-        # Check for traffic signs in semantic image
-        has_signs = np.any(semantic_image == self.CLASS_TO_ID.get('traffic_sign', 12))
-        
-        if has_signs:
-            # In a real implementation, this would use OCR or trained classifiers
-            # For now, return a default speed limit
-            return 50.0  # km/h
-        
-        return None
+        """Speed limit detection with sign analysis"""
+        try:
+            # Check for traffic signs in semantic image
+            traffic_sign_class_id = self.CLASS_TO_ID.get('traffic_sign', 12)
+            sign_mask = (semantic_image == traffic_sign_class_id)
+            
+            if not np.any(sign_mask):
+                return None
+            
+            # Find sign regions
+            sign_uint8 = sign_mask.astype(np.uint8) * 255
+            contours, _ = cv2.findContours(sign_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            for contour in contours:
+                area = cv2.contourArea(contour)
+                if area < 200:  # Minimum size for readable sign
+                    continue
+                
+                x, y, w, h = cv2.boundingRect(contour)
+                
+                # Basic sign shape validation (roughly square/rectangular)
+                aspect_ratio = w / max(h, 1)
+                if not (0.7 <= aspect_ratio <= 1.5):
+                    continue
+                
+                # Extract sign ROI
+                x = clamp(x, 0, rgb_image.shape[1] - 1)
+                y = clamp(y, 0, rgb_image.shape[0] - 1)
+                w = clamp(w, 1, rgb_image.shape[1] - x)
+                h = clamp(h, 1, rgb_image.shape[0] - y)
+                
+                sign_roi = rgb_image[y:y+h, x:x+w]
+                
+                if sign_roi.size == 0:
+                    continue
+                
+                # Placeholder for OCR/pattern recognition
+                # In a real implementation, this would use:
+                # 1. OCR to read numbers on signs
+                # 2. Template matching for standard speed limit signs
+                # 3. Machine learning classifier for sign recognition
+                
+                # For now, return common speed limits based on context
+                # This is a simplified approach
+                return 50.0  # km/h - common urban speed limit
+            
+            return None
+            
+        except Exception as e:
+            self.logger.error(f"Speed limit detection failed: {e}")
+            return None
     
     def _empty_perception(self, frame_id: int = 0, timestamp: float = 0.0) -> PerceptionOutput:
-        """Return empty perception output with proper initialization"""
-        return PerceptionOutput(
-            frame_id=frame_id,
-            timestamp=timestamp,
-            drivable_area=np.zeros((self.image_height, self.image_width), dtype=np.uint8),
-            safety_metrics=SafetyMetrics(),
-            sensor_quality={'rgb': 0.0, 'semantic': 0.0, 'depth': 0.0}
-        )
+        """Empty perception output with proper initialization"""
+        try:
+            return PerceptionOutput(
+                frame_id=frame_id,
+                timestamp=timestamp,
+                drivable_area=np.zeros((self.image_height, self.image_width), dtype=np.uint8),
+                safety_metrics=SafetyMetrics(),
+                sensor_quality={'rgb': 0.0, 'semantic': 0.0, 'depth': 0.0, 'overall': 0.0}
+            )
+        except Exception as e:
+            self.logger.error(f"Failed to create empty perception output: {e}")
+            # Return minimal valid output
+            return PerceptionOutput()
+    
+    def get_performance_stats(self) -> Dict[str, Any]:
+        """Get performance statistics from the monitor"""
+        try:
+            stats = self.performance_monitor.get_stats()
+            stats['total_frames_processed'] = self.frame_count
+            return stats
+        except Exception as e:
+            self.logger.error(f"Failed to get performance stats: {e}")
+            return {'error': str(e)}
+    
+    def reset_performance_monitor(self):
+        """Reset performance monitoring"""
+        try:
+            self.performance_monitor.reset()
+            self.frame_count = 0
+            self.logger.info("Performance monitor reset")
+        except Exception as e:
+            self.logger.error(f"Failed to reset performance monitor: {e}")
+    
+    def set_logging_level(self, level: int):
+        """Dynamically change logging level"""
+        try:
+            self.logger.setLevel(level)
+            logging.getLogger().setLevel(level)
+            self.logger.info(f"Logging level changed to {logging.getLevelName(level)}")
+        except Exception as e:
+            self.logger.error(f"Failed to set logging level: {e}")
+    
+    def cleanup(self):
+        """Cleanup resources and log final statistics"""
+        try:
+            # Log final performance statistics
+            if self.frame_count > 0:
+                final_stats = self.get_performance_stats()
+                self.logger.info(f"Perception system final stats: {final_stats}")
+            
+            # Clear tracking history
+            self.object_history.clear()
+            
+            self.logger.info("Perception system cleanup completed")
+            
+        except Exception as e:
+            self.logger.error(f"Cleanup failed: {e}")
+
+# Export the main class and data structures for easy importing
+__all__ = [
+    'PerceptionSystem',
+    'PerceptionOutput', 
+    'DetectedObject',
+    'LaneInfo',
+    'TrafficLightInfo',
+    'SafetyMetrics',
+    'TrafficLightState',
+    'ObjectType',
+    'LaneType'
+]
