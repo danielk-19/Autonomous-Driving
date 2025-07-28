@@ -67,7 +67,7 @@ cd CARLA_0.9.15/
 Collect training data using the autopilot:
 
 ```bash
-python sensors/capture_sensors.py --duration 1800  # 30 minutes
+python sensors/capture_sensors.py --max-frames 50000 --autopilot
 ```
 
 This will collect synchronized data at 20 FPS:
