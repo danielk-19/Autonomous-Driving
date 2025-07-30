@@ -121,7 +121,7 @@ python utils/data_processor.py --data_root ./data --action clean
 Train the behavioral cloning model:
 
 ```bash
-python models/train_bc.py --data_root ./data --epochs 50 --batch_size 32
+python models/train_bc.py --data_dir ./data/processed --num_epochs 50 --batch_size 32
 ```
 
 Model architecture:
@@ -135,10 +135,10 @@ Model architecture:
 
 ```bash
 # With custom learning rate and validation split
-python models/train_bc.py --data_root ./data --epochs 100 --batch_size 64 --lr 0.0001 --val_split 0.15
+python models/train_bc.py --data_dir ./data/processed --num_epochs 100 --batch_size 64 --learning_rate 0.0001 --val_split 0.15
 
 # Resume training from checkpoint
-python models/train_bc.py --data_root ./data --resume ./models/checkpoint_epoch_25.pth
+python models/train_bc.py --data_dir ./data/processed --resume ./models/checkpoint_epoch_25.pth
 ```
 
 ### 4. Run Autonomous Agent
