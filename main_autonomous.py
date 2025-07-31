@@ -162,9 +162,27 @@ class AutonomousDrivingSystem:
             
             # Setup sensor manager
             try:
-                self.sensor_manager = SensorManager(self.vehicle, self.world)
-                self.sensor_manager.setup_sensors()
-                self.logger.info("Sensor system initialized")
+                # Pass output directory if data saving is enabled
+                output_dir = str(self.data_path) if self.save_data and self.data_path else None
+                
+                # Initializes sensor manager
+                self.sensor_manager = SensorManager(self.world, self.vehicle, output_dir)
+                
+                if not self.sensor_manager.setup_sensors():
+                    raise RuntimeError("Sensor setup failed")
+                
+                # Wait for sensors to initialize
+                self.logger.info("Waiting for sensor initialization...")
+                for _ in range(10):
+                    self.world.tick()
+                    time.sleep(0.05)
+                
+                # Wait for initial sensor data
+                if not self.sensor_manager.wait_for_data(['rgb'], timeout=10.0):
+                    self.logger.warning("RGB sensor data not ready within timeout")
+                else:
+                    self.logger.info("Sensors initialized and data ready")
+                    
             except Exception as e:
                 if self.vehicle:
                     self.vehicle.destroy()

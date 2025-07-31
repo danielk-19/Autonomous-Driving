@@ -127,7 +127,7 @@ class BCTrainer:
         self.perf_monitor = PerformanceMonitor()
         
         # TensorBoard logging
-        log_dir = os.path.join(save_dir, 'logs', f'training_{get_timestamp()}')
+        log_dir = os.path.join('logs', f'training_{get_timestamp()}')
         ensure_dir(log_dir)
         self.writer = SummaryWriter(log_dir)
         
@@ -473,7 +473,7 @@ class BCTrainer:
             # Check if target performance reached
             if val_losses['total_loss'] < self.target_val_mse and not self.target_reached:
                 self.target_reached = True
-                logger.info(f"🎯 TARGET REACHED! Validation MSE: {val_losses['total_loss']:.4f} < {self.target_val_mse}")
+                logger.info(f"TARGET REACHED! Validation MSE: {val_losses['total_loss']:.4f} < {self.target_val_mse}")
             
             # Print epoch summary
             logger.info(f'\nEpoch {epoch + 1}/{self.current_epoch + num_epochs}:')
@@ -512,7 +512,7 @@ class BCTrainer:
         
         # Training summary
         total_time = time.time() - start_time
-        logger.info(f"\n🏁 Training completed in {total_time/3600:.2f} hours")
+        logger.info(f"\nTraining completed in {total_time/3600:.2f} hours")
         logger.info(f"Best validation loss: {self.best_val_loss:.4f}")
         logger.info(f"Target MSE ({self.target_val_mse}) reached: {self.target_reached}")
         
@@ -882,7 +882,7 @@ def test_training_setup(args):
             predictions = test_model(images)
         
         logger.info(f"Test batch - Images: {images.shape}, Predictions: {predictions.shape}")
-        logger.info("Training setup test passed ✓")
+        logger.info("Training setup test passed")
         return True
         
     except Exception as e:

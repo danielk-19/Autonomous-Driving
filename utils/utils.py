@@ -50,10 +50,22 @@ def load_json(file_path):
 
 def save_json(data, file_path, indent=2):
     """Safely save data to JSON file"""
+    def convert(obj):
+        """Converts numpy format to standard"""
+        if isinstance(obj, (np.integer, np.int32, np.int64)):
+            return int(obj)
+        elif isinstance(obj, (np.floating, np.float32, np.float64)):
+            return float(obj)
+        elif isinstance(obj, np.bool_):
+            return bool(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return str(obj)
+
     try:
         Path(file_path).parent.mkdir(parents=True, exist_ok=True)
         with open(file_path, 'w') as f:
-            json.dump(data, f, indent=indent)
+            json.dump(data, f, indent=indent, default=convert)
         return True
     except Exception as e:
         logging.error(f"Failed to save JSON to {file_path}: {e}")

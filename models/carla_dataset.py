@@ -120,7 +120,8 @@ class CARLADataset(Dataset):
                 # Validate sample paths exist
                 valid_samples = []
                 for sample in samples:
-                    if os.path.exists(sample.get('image_path', '')):
+                    image_path = os.path.join(self.data_dir, sample.get('image_path', ''))
+                    if os.path.exists(image_path):
                         valid_samples.append(sample)
                     else:
                         logger.warning(f"Image not found: {sample.get('image_path', 'unknown')}")
@@ -263,11 +264,12 @@ class CARLADataset(Dataset):
         sample = self.samples[idx]
         
         # Load image using utils
-        image = load_image(sample['image_path'])
+        image_path = os.path.join(self.data_dir, sample['image_path'])
+        image = load_image(image_path)
         if image is None:
             # Fallback to PIL
             try:
-                image = np.array(Image.open(sample['image_path']).convert('RGB'))
+                image = np.array(Image.open(image_path).convert('RGB'))
             except Exception as e:
                 logger.error(f"Failed to load image {sample['image_path']}: {e}")
                 # Return black image as fallback

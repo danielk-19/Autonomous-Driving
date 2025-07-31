@@ -666,9 +666,9 @@ def main():
             meets_comfort = overall_scores['comfort'] >= 75
             
             logger.info(f"\nCOMPLIANCE:")
-            logger.info(f"Safety Target (90+): {'✓' if meets_safety else '✗'} ({overall_scores['safety']:.1f})")
-            logger.info(f"Efficiency Target (80%+ completion): {'✓' if meets_efficiency else '✗'} ({completion_rate*100:.1f}%)")
-            logger.info(f"Comfort Target (75+): {'✓' if meets_comfort else '✗'} ({overall_scores['comfort']:.1f})")
+            logger.info(f"Safety Target (90+): {'Pass' if meets_safety else 'Fail'} ({overall_scores['safety']:.1f})")
+            logger.info(f"Efficiency Target (80%+ completion): {'Pass' if meets_efficiency else 'Fail'} ({completion_rate*100:.1f}%)")
+            logger.info(f"Comfort Target (75+): {'Pass' if meets_comfort else 'Fail'} ({overall_scores['comfort']:.1f})")
             
             # Save comprehensive summary
             summary = {

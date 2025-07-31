@@ -32,75 +32,103 @@ import logging
 logger = logging.getLogger(__name__)
 
 class SensorManager:
-    """Manages all sensors for data collection with optimized performance"""
+    """Manages all sensors for data collection and autonomous driving with real-time data access"""
     
-    def __init__(self, world, vehicle, output_dir):
+    def __init__(self, world, vehicle, output_dir=None):
+        """
+        Initialize sensor manager
+        Args:
+            vehicle: CARLA vehicle actor
+            world: CARLA world object
+            output_dir: Optional output directory for saving data
+        """
         self.world = world
         self.vehicle = vehicle
-        self.output_dir = Path(output_dir)
         self.sensors = {}
         self.sensor_data = {}
         self.frame_count = 0
+        self.latest_data = {}
         
         # Performance monitoring
         self.performance = PerformanceMonitor()
         
-        # Create output directories using utils
-        for sensor_type in ['rgb', 'semantic', 'depth', 'gps', 'imu', 'control']:
-            ensure_dir(self.output_dir / sensor_type)
+        # Setup output directory if provided
+        if output_dir:
+            self.output_dir = Path(output_dir)
+            # Create output directories using utils
+            for sensor_type in ['rgb', 'semantic', 'depth', 'gps', 'imu', 'control']:
+                ensure_dir(self.output_dir / sensor_type)
+            logger.info(f"Output directory created: {output_dir}")
+        else:
+            self.output_dir = None
         
-        logger.info(f"Output directory created: {output_dir}")
+        # Data ready flags
+        self.data_ready = {
+            'rgb': False,
+            'semantic': False,
+            'depth': False,
+            'gps': False,
+            'imu': False
+        }
+        
+        logger.info("SensorManager initialized")
     
     def setup_sensors(self):
         """Setup all sensors with optimized configuration"""
-        bp_lib = self.world.get_blueprint_library()
-        
-        # Common sensor configuration
-        sensor_config = {
-            'image_size_x': '800',
-            'image_size_y': '600',
-            'fov': '90',
-            'sensor_tick': '0.05'  # 20 FPS
-        }
-        
-        # Camera mount position
-        camera_transform = carla.Transform(carla.Location(x=1.5, z=2.4))
-        
-        # RGB Camera
-        rgb_bp = bp_lib.find('sensor.camera.rgb')
-        for key, value in sensor_config.items():
-            rgb_bp.set_attribute(key, value)
-        self.sensors['rgb'] = self.world.spawn_actor(rgb_bp, camera_transform, attach_to=self.vehicle)
-        self.sensors['rgb'].listen(lambda data: self._rgb_callback(data))
-        
-        # Semantic Segmentation Camera
-        sem_bp = bp_lib.find('sensor.camera.semantic_segmentation')
-        for key, value in sensor_config.items():
-            sem_bp.set_attribute(key, value)
-        self.sensors['semantic'] = self.world.spawn_actor(sem_bp, camera_transform, attach_to=self.vehicle)
-        self.sensors['semantic'].listen(lambda data: self._semantic_callback(data))
-        
-        # Depth Camera
-        depth_bp = bp_lib.find('sensor.camera.depth')
-        for key, value in sensor_config.items():
-            depth_bp.set_attribute(key, value)
-        self.sensors['depth'] = self.world.spawn_actor(depth_bp, camera_transform, attach_to=self.vehicle)
-        self.sensors['depth'].listen(lambda data: self._depth_callback(data))
-        
-        # GPS Sensor
-        gps_bp = bp_lib.find('sensor.other.gnss')
-        gps_bp.set_attribute('sensor_tick', '0.05')
-        self.sensors['gps'] = self.world.spawn_actor(gps_bp, carla.Transform(), attach_to=self.vehicle)
-        self.sensors['gps'].listen(lambda data: self._gps_callback(data))
-        
-        # IMU Sensor
-        imu_bp = bp_lib.find('sensor.other.imu')
-        imu_bp.set_attribute('sensor_tick', '0.05')
-        self.sensors['imu'] = self.world.spawn_actor(imu_bp, carla.Transform(), attach_to=self.vehicle)
-        self.sensors['imu'].listen(lambda data: self._imu_callback(data))
-        
-        logger.info(f"All {len(self.sensors)} sensors initialized successfully")
-        return True
+        try:
+            bp_lib = self.world.get_blueprint_library()
+            
+            # Common sensor configuration
+            sensor_config = {
+                'image_size_x': '800',
+                'image_size_y': '600',
+                'fov': '90',
+                'sensor_tick': '0.05'  # 20 FPS
+            }
+            
+            # Camera mount position
+            camera_transform = carla.Transform(carla.Location(x=1.5, z=2.4))
+            
+            # RGB Camera
+            rgb_bp = bp_lib.find('sensor.camera.rgb')
+            for key, value in sensor_config.items():
+                rgb_bp.set_attribute(key, value)
+            self.sensors['rgb'] = self.world.spawn_actor(rgb_bp, camera_transform, attach_to=self.vehicle)
+            self.sensors['rgb'].listen(lambda data: self._rgb_callback(data))
+            
+            # Semantic Segmentation Camera
+            sem_bp = bp_lib.find('sensor.camera.semantic_segmentation')
+            for key, value in sensor_config.items():
+                sem_bp.set_attribute(key, value)
+            self.sensors['semantic'] = self.world.spawn_actor(sem_bp, camera_transform, attach_to=self.vehicle)
+            self.sensors['semantic'].listen(lambda data: self._semantic_callback(data))
+            
+            # Depth Camera
+            depth_bp = bp_lib.find('sensor.camera.depth')
+            for key, value in sensor_config.items():
+                depth_bp.set_attribute(key, value)
+            self.sensors['depth'] = self.world.spawn_actor(depth_bp, camera_transform, attach_to=self.vehicle)
+            self.sensors['depth'].listen(lambda data: self._depth_callback(data))
+            
+            # GPS Sensor
+            gps_bp = bp_lib.find('sensor.other.gnss')
+            gps_bp.set_attribute('sensor_tick', '0.05')
+            self.sensors['gps'] = self.world.spawn_actor(gps_bp, carla.Transform(), attach_to=self.vehicle)
+            self.sensors['gps'].listen(lambda data: self._gps_callback(data))
+            
+            # IMU Sensor
+            imu_bp = bp_lib.find('sensor.other.imu')
+            imu_bp.set_attribute('sensor_tick', '0.05')
+            self.sensors['imu'] = self.world.spawn_actor(imu_bp, carla.Transform(), attach_to=self.vehicle)
+            self.sensors['imu'].listen(lambda data: self._imu_callback(data))
+            
+            logger.info(f"All {len(self.sensors)} sensors initialized successfully")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to setup sensors: {e}")
+            self.cleanup()
+            return False
     
     def _rgb_callback(self, image):
         """Process RGB camera data"""
@@ -109,7 +137,11 @@ class SensorManager:
             array = array.reshape((image.height, image.width, 4))
             # Remove alpha channel and convert to RGB
             rgb_array = array[:, :, :3]
+            
             self.sensor_data['rgb'] = rgb_array.copy()
+            self.latest_data['rgb'] = rgb_array.copy()
+            self.data_ready['rgb'] = True
+            
         except Exception as e:
             logger.error(f"RGB callback error: {e}")
     
@@ -120,7 +152,11 @@ class SensorManager:
             array = array.reshape((image.height, image.width, 4))
             # Extract semantic class ID from red channel
             semantic_array = array[:, :, 2]
+            
             self.sensor_data['semantic'] = semantic_array.copy()
+            self.latest_data['semantic'] = semantic_array.copy()
+            self.data_ready['semantic'] = True
+            
         except Exception as e:
             logger.error(f"Semantic callback error: {e}")
     
@@ -137,24 +173,32 @@ class SensorManager:
             depth_meters = normalized * 1000  # CARLA depth range
             
             self.sensor_data['depth'] = depth_meters.copy()
+            self.latest_data['depth'] = depth_meters.copy()
+            self.data_ready['depth'] = True
+            
         except Exception as e:
             logger.error(f"Depth callback error: {e}")
     
     def _gps_callback(self, data):
         """Process GPS data"""
         try:
-            self.sensor_data['gps'] = {
+            gps_data = {
                 'lat': float(data.latitude),
                 'lon': float(data.longitude), 
                 'alt': float(data.altitude)
             }
+            
+            self.sensor_data['gps'] = gps_data
+            self.latest_data['gps'] = gps_data
+            self.data_ready['gps'] = True
+            
         except Exception as e:
             logger.error(f"GPS callback error: {e}")
     
     def _imu_callback(self, data):
         """Process IMU data"""
         try:
-            self.sensor_data['imu'] = {
+            imu_data = {
                 'accel_x': float(data.accelerometer.x),
                 'accel_y': float(data.accelerometer.y),
                 'accel_z': float(data.accelerometer.z),
@@ -163,11 +207,68 @@ class SensorManager:
                 'gyro_z': float(data.gyroscope.z),
                 'compass': float(data.compass)
             }
+            
+            self.sensor_data['imu'] = imu_data
+            self.latest_data['imu'] = imu_data
+            self.data_ready['imu'] = True
+            
         except Exception as e:
             logger.error(f"IMU callback error: {e}")
     
+    def get_latest_data(self):
+        """
+        Get the latest sensor data - method expected by main_autonomous.py
+        Returns a copy of the latest sensor data
+        """
+        return self.latest_data.copy()
+    
+    def get_sensor_status(self):
+        """Get status of all sensors for HUD display"""
+        return {
+            'rgb': self.data_ready['rgb'] and 'rgb' in self.latest_data,
+            'semantic': self.data_ready['semantic'] and 'semantic' in self.latest_data,
+            'depth': self.data_ready['depth'] and 'depth' in self.latest_data,
+            'gps': self.data_ready['gps'] and 'gps' in self.latest_data,
+            'imu': self.data_ready['imu'] and 'imu' in self.latest_data,
+        }
+    
+    def is_data_ready(self, required_sensors=None):
+        """
+        Check if required sensor data is ready
+        Args:
+            required_sensors: List of required sensors (default: ['rgb'])
+        Returns:
+            bool: True if all required sensors have data
+        """
+        if required_sensors is None:
+            required_sensors = ['rgb']
+        
+        for sensor in required_sensors:
+            if not self.data_ready.get(sensor, False):
+                return False
+        return True
+    
+    def wait_for_data(self, required_sensors=None, timeout=5.0):
+        """
+        Wait for sensor data to be ready
+        Args:
+            required_sensors: List of required sensors
+            timeout: Maximum wait time in seconds
+        Returns:
+            bool: True if data is ready, False if timeout
+        """
+        start_time = time.time()
+        while time.time() - start_time < timeout:
+            if self.is_data_ready(required_sensors):
+                return True
+            time.sleep(0.01)  # Small sleep to prevent busy waiting
+        return False
+    
     def save_frame_data(self):
-        """Save all sensor data for current frame"""
+        """Save all sensor data for current frame (if output directory is set)"""
+        if not self.output_dir:
+            return None
+            
         try:
             self.performance.log_frame()
             
@@ -220,7 +321,7 @@ class SensorManager:
                 'throttle': float(control.throttle),
                 'brake': float(control.brake),
                 'speed': float(speed),
-                'timestamp': time.time(),  # Add timestamp
+                'timestamp': time.time(),
                 'hand_brake': bool(control.hand_brake),
                 'reverse': bool(control.reverse),
                 'gear': int(control.gear),
@@ -252,11 +353,12 @@ class SensorManager:
         perf_stats = self.performance.get_stats()
         return {
             'total_frames': self.frame_count,
-            'output_dir': str(self.output_dir),
+            'output_dir': str(self.output_dir) if self.output_dir else None,
             'sensors_active': len(self.sensors),
             'data_types': list(self.sensor_data.keys()),
             'avg_fps': perf_stats['avg_fps'],
-            'total_time': perf_stats['total_time']
+            'total_time': perf_stats['total_time'],
+            'data_ready': self.data_ready.copy()
         }
     
     def cleanup(self):
@@ -354,6 +456,10 @@ def main():
         for i in range(10):
             world.tick()
             time.sleep(0.05)
+        
+        # Wait for initial sensor data
+        if not sensor_manager.wait_for_data(['rgb'], timeout=10.0):
+            logger.warning("Initial sensor data not ready, continuing anyway...")
         
         # Enable autopilot if requested
         if args.autopilot:

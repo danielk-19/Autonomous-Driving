@@ -27,7 +27,7 @@ import sys
 root_path = Path(__file__).parent.parent
 sys.path.insert(0, str(root_path))
 
-from utils.utils import (
+from utils import (
     setup_logging, load_json, save_json, ensure_dir, get_timestamp,
     safe_float, safe_int, load_image, save_image, combine_rgb_semantic,
     validate_measurements_format, Timer, PerformanceMonitor

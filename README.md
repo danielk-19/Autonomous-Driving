@@ -72,7 +72,7 @@ cd CARLA_0.9.15/
 Collect training data using the autopilot:
 
 ```bash
-python sensors/capture_sensors.py --max-frames 50000 --autopilot
+python sensors/capture_sensors.py --max-frames 5000 --autopilot
 ```
 
 This will collect synchronized data at 20 FPS:
@@ -146,7 +146,7 @@ python models/train_bc.py --data_dir ./data/processed --resume ./models/checkpoi
 Test your trained agent:
 
 ```bash
-python main_autonomous.py --model ./models/bc_model.pth --spawn-point 0
+python main_autonomous.py --model ./checkpoints/final_model.pth --spawn-point 0
 ```
 
 **Alternative run commands:**
@@ -156,16 +156,16 @@ python main_autonomous.py --model ./models/bc_model.pth --spawn-point 0
 python main_autonomous.py
 
 # Headless mode for performance testing
-python main_autonomous.py --model ./models/bc_model.pth --no-display --frames 5000
+python main_autonomous.py --model ./checkpoints/final_model.pth --no-display --frames 5000
 
 # Specific route with traffic
-python main_autonomous.py --model ./models/bc_model.pth --spawn-point 5 --dest 20
+python main_autonomous.py --model ./checkpoints/final_model.pth --spawn-point 5 --dest 20
 
 # No data collection, display only
-python main_autonomous.py --model ./models/bc_model.pth --no-save
+python main_autonomous.py --model ./checkpoints/final_model.pth --no-save
 
 # Custom CARLA server
-python main_autonomous.py --host 192.168.1.100 --port 2000 --model ./models/bc_model.pth
+python main_autonomous.py --host 192.168.1.100 --port 2000 --model ./checkpoints/final_model.pth
 ```
 
 ### 5. Evaluate Performance
