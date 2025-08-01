@@ -341,11 +341,11 @@ class AutonomousDrivingSystem:
             hud_info.extend([
                 "",
                 "Sensors:",
-                f"  RGB: {'✓' if sensor_status.get('rgb', False) else '✗'}",
-                f"  Semantic: {'✓' if sensor_status.get('semantic', False) else '✗'}",
-                f"  Depth: {'✓' if sensor_status.get('depth', False) else '✗'}",
-                f"  GPS: {'✓' if sensor_status.get('gps', False) else '✗'}",
-                f"  IMU: {'✓' if sensor_status.get('imu', False) else '✗'}",
+                f"  RGB: {'Pass' if sensor_status.get('rgb', False) else 'Fail'}",
+                f"  Semantic: {'Pass' if sensor_status.get('semantic', False) else 'Fail'}",
+                f"  Depth: {'Pass' if sensor_status.get('depth', False) else 'Fail'}",
+                f"  GPS: {'Pass' if sensor_status.get('gps', False) else 'Fail'}",
+                f"  IMU: {'Pass' if sensor_status.get('imu', False) else 'Fail'}",
             ])
         
         # Vehicle control information

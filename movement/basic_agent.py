@@ -668,7 +668,8 @@ class MotionPlanner:
     
     def _calculate_lane_keeping_steer(self, perception: PerceptionOutput) -> float:
         """Calculate steering to stay in lane center"""
-        if not perception.lane_info or not getattr(perception.lane_info, 'center_line', None):
+        center_line = getattr(perception.lane_info, 'center_line', None)
+        if perception.lane_info is None or center_line is None or len(center_line) == 0:
             return 0.0
         
         lane_info = perception.lane_info
