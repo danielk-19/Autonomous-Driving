@@ -1921,7 +1921,10 @@ class PerceptionSystem:
                 # Look for significant changes in road area (intersection expansion)
                 area_changes = []
                 for i in range(1, len(road_areas)):
-                    change_ratio = road_areas[i] / max(road_areas[i-1], 1)
+                    min_valid_area, max_valid_area = 100, 10000
+                    if road_areas[i-1] < min_valid_area or road_areas[i-1] > max_valid_area:
+                        continue
+                    change_ratio = road_areas[i] / road_areas[i-1]
                     area_changes.append(change_ratio)
                 
                 # Significant expansion might indicate intersection
@@ -1941,7 +1944,7 @@ class PerceptionSystem:
                 )
                 
                 # Many separate lane marking components might indicate intersection
-                if len(contours) > 8:  # Complex lane marking pattern
+                if len(contours) > 8 and len(contours) < 100:  # Complex lane marking pattern
                     return True
             
             return False

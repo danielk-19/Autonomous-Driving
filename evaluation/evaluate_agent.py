@@ -417,13 +417,13 @@ class AgentEvaluator:
             if not vehicle:
                 self.logger.error("Failed to spawn test vehicle")
                 return None
-            
+             
             # Setup background traffic
             background_actors = self.setup_background_traffic(traffic_density)
             
             try:
                 # Initialize sensor system
-                sensor_manager = SensorManager(vehicle, self.world)
+                sensor_manager = SensorManager(self.world, vehicle)
                 sensor_manager.setup_sensors()
                 
                 # Initialize the hybrid agent (THIS IS THE KEY FIX)
